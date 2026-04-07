@@ -19,6 +19,7 @@
 #include <segwit_addr.h>
 #include <redpallas.h>
 #include <hwp.h>
+#include <orchard_signer.h>
 // From: lib/qrcode
 #include <qrcodegen.h>
 #include <stdio.h>
@@ -433,6 +434,9 @@ static int32_t sign_worker_thread(void* ctx) {
     hwp_parser_init(&parser);
     SerialParserCtx spc = {.parser = &parser, .last_result = HWP_FEED_INCOMPLETE};
 
+    OrchardSignerCtx signer_ctx;
+    orchard_signer_init(&signer_ctx);
+
     uint8_t seq = 0;
     bool connected = false;
     bool user_confirmed = false;
@@ -487,7 +491,9 @@ static int32_t sign_worker_thread(void* ctx) {
         case HWP_MSG_PING:
             hwp_send(f->seq, HWP_MSG_PONG, NULL, 0);
             if(user_confirmed) {
+                // New session: reset signing and verification state
                 user_confirmed = false;
+                orchard_signer_reset(&signer_ctx);
                 s_sign_page = PAGE_SIGN_WAIT;
                 with_view_model(
                     w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
@@ -504,13 +510,52 @@ static int32_t sign_worker_thread(void* ctx) {
         }
 
         case HWP_MSG_TX_OUTPUT: {
-            // HWP v2: acknowledge individual tx outputs for staged verification
+            // HWP v2: staged sighash verification via OrchardSignerCtx
             HwpTxOutput txo;
             if(!hwp_parse_tx_output(f->payload, f->payload_len, &txo)) {
                 hwp_send_error(f->seq, HWP_ERR_BAD_FRAME, "Invalid TX_OUTPUT payload");
                 break;
             }
-            // Send acknowledgement
+
+            OrchardSignerError serr;
+            if(txo.output_index == HWP_TX_META_INDEX) {
+                // Transaction metadata (first message)
+                serr = orchard_signer_feed_meta(
+                    &signer_ctx, txo.output_data, txo.output_data_len, txo.total_outputs);
+                if(serr != SIGNER_OK) {
+                    hwp_send_error(f->seq, HWP_ERR_BAD_FRAME, "Bad TX metadata");
+                    orchard_signer_reset(&signer_ctx);
+                    break;
+                }
+            } else if(txo.output_index == txo.total_outputs) {
+                // Sentinel: expected sighash for comparison
+                if(txo.output_data_len != 32) {
+                    hwp_send_error(f->seq, HWP_ERR_BAD_SIGHASH, "Bad sighash length");
+                    orchard_signer_reset(&signer_ctx);
+                    break;
+                }
+                serr = orchard_signer_verify(&signer_ctx, txo.output_data);
+                if(serr == SIGNER_ERR_SIGHASH_MISMATCH) {
+                    hwp_send_error(f->seq, HWP_ERR_SIGHASH_MISMATCH,
+                        "Device sighash != companion sighash");
+                    orchard_signer_reset(&signer_ctx);
+                    break;
+                } else if(serr != SIGNER_OK) {
+                    hwp_send_error(f->seq, HWP_ERR_INVALID_STATE, "Verify failed");
+                    orchard_signer_reset(&signer_ctx);
+                    break;
+                }
+            } else {
+                // Action data (index 0..N-1)
+                serr = orchard_signer_feed_action(
+                    &signer_ctx, txo.output_data, txo.output_data_len);
+                if(serr != SIGNER_OK) {
+                    hwp_send_error(f->seq, HWP_ERR_BAD_FRAME, "Bad action data");
+                    orchard_signer_reset(&signer_ctx);
+                    break;
+                }
+            }
+
             hwp_send(f->seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
             break;
         }
@@ -519,6 +564,21 @@ static int32_t sign_worker_thread(void* ctx) {
             HwpSignReq req;
             if(!hwp_parse_sign_req(f->payload, f->payload_len, &req)) {
                 hwp_send_error(f->seq, HWP_ERR_BAD_SIGHASH, "Invalid SIGN_REQ payload");
+                break;
+            }
+
+            // Enforce ZIP-244 verification before signing
+            OrchardSignerError chk = orchard_signer_check(&signer_ctx, req.sighash);
+            if(chk == SIGNER_ERR_NOT_VERIFIED) {
+                hwp_send_error(f->seq, HWP_ERR_INVALID_STATE,
+                    "ZIP-244 verification not completed");
+                break;
+            } else if(chk == SIGNER_ERR_WRONG_SIGHASH) {
+                hwp_send_error(f->seq, HWP_ERR_SIGHASH_MISMATCH,
+                    "SIGN_REQ sighash != verified sighash");
+                break;
+            } else if(chk != SIGNER_OK) {
+                hwp_send_error(f->seq, HWP_ERR_INVALID_STATE, "Signer check failed");
                 break;
             }
 
@@ -573,7 +633,7 @@ static int32_t sign_worker_thread(void* ctx) {
                 user_confirmed = true;
             }
 
-            // Sign
+            // Sign via OrchardSignerCtx (enforces verification invariant)
             s_sign_page = PAGE_SIGN_DONE;
             s_sign_done = false;
             with_view_model(
@@ -581,9 +641,10 @@ static int32_t sign_worker_thread(void* ctx) {
 
             pallas_set_progress_cb(flipz_progress_cb, NULL);
             uint8_t sig[64], rk[32];
-            int ret = redpallas_sign(w->ask, req.alpha, req.sighash, sig, rk);
+            OrchardSignerError serr = orchard_signer_sign(
+                &signer_ctx, req.sighash, w->ask, req.alpha, sig, rk);
 
-            if(ret != 0) {
+            if(serr != SIGNER_OK) {
                 hwp_send_error(f->seq, HWP_ERR_SIGN_FAILED, "RedPallas sign failed");
                 s_sign_page = PAGE_SIGN_WAIT;
                 with_view_model(
@@ -606,10 +667,11 @@ static int32_t sign_worker_thread(void* ctx) {
         case HWP_MSG_ABORT:
             // Companion requested session abort
             s_sign_cancelled = true;
+            user_confirmed = false;
+            orchard_signer_reset(&signer_ctx);
             s_sign_page = PAGE_SIGN_WAIT;
             with_view_model(
                 w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
-            user_confirmed = false;
             break;
 
         default:

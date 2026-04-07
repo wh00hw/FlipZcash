@@ -22,9 +22,9 @@ The BIP39 mnemonic implementation and the overall Flipper Zero app architecture 
 
 FlipZcash relies on two companion libraries, both purpose-built for this project:
 
-- **[libzcash-orchard-c](https://github.com/wh00hw/libzcash-orchard-c)** — Pure C implementation of Zcash Orchard cryptography: Pallas curve arithmetic, Sinsemilla hash, RedPallas signatures, ZIP-32 key derivation, FF1-AES-256, F4Jumble, BIP39. Portable across embedded targets.
+- **[libzcash-orchard-c](https://github.com/wh00hw/libzcash-orchard-c)** (git submodule) — Pure C implementation of Zcash Orchard cryptography: Pallas curve arithmetic, Sinsemilla hash, RedPallas signatures, ZIP-32 key derivation, FF1-AES-256, F4Jumble, BIP39, ZIP-244 sighash computation, and the `OrchardSigner` state machine for on-device sighash verification. Portable across embedded targets.
 
-- **[zcash-hw-wallet-sdk](https://github.com/wh00hw/zcash-hw-wallet-sdk)** — Rust SDK defining the Hardware Wallet Protocol (HWP v2), the binary framed serial protocol used for communication between the Flipper Zero and the companion broadcast app. The Flipper side implements the device end of this protocol.
+- **[zcash-hw-wallet-sdk](https://github.com/wh00hw/zcash-hw-wallet-sdk)** — Rust SDK implementing the Hardware Wallet Protocol (HWP v2), the binary framed serial protocol used for communication between the Flipper Zero and the companion broadcast app. Handles PCZT parsing, Orchard proof generation, staged sighash verification, and signature collection.
 
 ## Features
 
@@ -32,9 +32,26 @@ FlipZcash relies on two companion libraries, both purpose-built for this project
 - **Import wallet** — Word-by-word mnemonic entry with autocomplete
 - **Shielded address** — Orchard Unified Address with QR code display
 - **USB Serial Signer** — Sign transactions via HWP v2 protocol with on-device confirmation (recipient, amount, fee)
+- **ZIP-244 sighash verification** — On-device staged verification: the companion sends transaction metadata and action data individually, the device hashes them incrementally using ZIP-244, and compares the computed sighash against the companion's before allowing any signature
 - **Key export** — Full Viewing Key (ak, nk, rivk) for watch-only wallets
 - **Mainnet/Testnet** — Switch between ZEC and TAZ networks
 - **Encrypted storage** — Mnemonic encrypted on SD card with RC4 (K1/K2 scheme)
+- **Hardware RNG** — Uses the STM32WB55 true random number generator for all cryptographic randomness
+
+## Signing Protocol (HWP v2)
+
+The signing flow implements the staged sighash verification protocol defined by `zcash-hw-wallet-sdk`:
+
+1. **Handshake** — Device sends PING, companion replies PONG
+2. **FVK export** — Companion requests Full Viewing Key for wallet pairing
+3. **Staged verification** — Companion sends transaction data for on-device ZIP-244 sighash computation:
+   - `TX_OUTPUT(0xFFFF, N, metadata)` — Transaction header (125 bytes: version, branch ID, lock time, expiry, orchard flags, value balance, anchor, transparent/sapling digests)
+   - `TX_OUTPUT(i, N, action_data)` × N — Each Orchard action (820 bytes: cv_net, nullifier, rk, cmx, ephemeral_key, enc_ciphertext, out_ciphertext)
+   - `TX_OUTPUT(N, N, sighash)` — Sentinel with expected sighash for comparison
+4. **User confirmation** — Device displays recipient, amount, fee; user approves or cancels
+5. **Signing** — `SIGN_REQ` → `orchard_signer_sign()` (enforces verification invariant) → `SIGN_RSP`
+
+The `OrchardSignerCtx` state machine in libzcash-orchard-c guarantees at the library level that signatures cannot be produced without completing ZIP-244 verification first.
 
 ## Sinsemilla Lookup Table
 
@@ -57,12 +74,18 @@ Subsequent launches use the cached address and skip derivation entirely.
 Requires the [Unleashed Firmware](https://github.com/DarkFlippers/unleashed-firmware) toolchain:
 
 ```bash
+# Clone with submodules
+git clone --recurse-submodules https://github.com/wh00hw/FlipZcash.git
+
 # Symlink into the firmware
 ln -s /path/to/FlipZcash /path/to/unleashed-firmware/applications_user/FlipZcash
 
 # Build
 cd /path/to/unleashed-firmware
 ./fbt fap_flipz
+
+# Install and launch on connected Flipper
+./fbt launch APPSRC=applications_user/FlipZcash
 ```
 
 The compiled `.fap` will be at `build/f7-firmware-D/.extapps/flipz.fap`.
@@ -78,6 +101,7 @@ FlipZcash/
     flipz_file.*            Encrypted wallet storage (wallet.dat)
     flipz_string.*          Hex conversion, RC4 cipher
     flipz_serial.*          USB CDC serial communication
+    flipz_rng.c             Hardware RNG bridge (STM32WB55 → libzcash)
     flipz_custom_event.h    Input event definitions
   scenes/
     flipz_scene_menu.c      Main menu
@@ -86,7 +110,7 @@ FlipZcash/
   views/
     flipz_scene_1.*         Address generation, key display, serial signer
   lib/
-    zcash/                  libzcash-orchard-c (cryptography)
+    zcash/                  libzcash-orchard-c (git submodule)
     qrcode/                 QR code generation (qrcodegen)
 ```
 
