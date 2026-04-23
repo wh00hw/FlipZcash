@@ -9,7 +9,7 @@
 #include "../helpers/flipz_string.h"
 #include "../helpers/flipz_file.h"
 #include "../helpers/flipz_serial.h"
-// From: lib/zcash
+// From: lib/libzcash-orchard-c
 #include <memzero.h>
 #include <rand.h>
 #include <bip39.h>
@@ -20,6 +20,9 @@
 #include <redpallas.h>
 #include <hwp.h>
 #include <orchard_signer.h>
+#include <zip244.h>
+#include <bip32.h>
+#include <secp256k1.h>
 // From: lib/qrcode
 #include <qrcodegen.h>
 #include <stdio.h>
@@ -390,6 +393,8 @@ typedef struct {
     uint8_t ak[32];
     uint8_t nk[32];
     uint8_t rivk[32];
+    uint8_t t_sk[32];     // Transparent BIP-32 spending key (v3)
+    uint8_t t_pubkey[33]; // Transparent compressed pubkey (v3)
     bool testnet;
     View* view;
 } SignWorkerCtx;
@@ -501,6 +506,34 @@ static int32_t sign_worker_thread(void* ctx) {
             break;
 
         case HWP_MSG_FVK_REQ: {
+            // v2.1: parse coin_type from payload for network discrimination
+            if(f->payload_len >= HWP_FVK_REQ_SIZE) {
+                uint32_t req_coin = (uint32_t)f->payload[0] |
+                                    ((uint32_t)f->payload[1] << 8) |
+                                    ((uint32_t)f->payload[2] << 16) |
+                                    ((uint32_t)f->payload[3] << 24);
+                uint32_t device_coin = w->testnet ? 1u : 133u;
+                if(req_coin != 0 && req_coin != device_coin) {
+                    hwp_send_error(
+                        f->seq,
+                        HWP_ERR_NETWORK_MISMATCH,
+                        w->testnet ? "Device is on testnet"
+                                   : "Device is on mainnet");
+                    s_net_err_msg = w->testnet
+                        ? "Companion requested MAINNET"
+                        : "Companion requested TESTNET";
+                    s_sign_page = PAGE_SIGN_NET_ERR;
+                    with_view_model(
+                        w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
+                    for(int i = 0; i < 30 && s_sign_page != 0; i++) furi_delay_ms(100);
+                    if(s_sign_page == 0) break;
+                    s_sign_page = PAGE_SIGN_WAIT;
+                    with_view_model(
+                        w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
+                    break;
+                }
+                signer_ctx.coin_type = req_coin;
+            }
             uint8_t payload[96];
             memcpy(payload, w->ak, 32);
             memcpy(payload + 32, w->nk, 32);
@@ -522,7 +555,21 @@ static int32_t sign_worker_thread(void* ctx) {
                 // Transaction metadata (first message)
                 serr = orchard_signer_feed_meta(
                     &signer_ctx, txo.output_data, txo.output_data_len, txo.total_outputs);
-                if(serr != SIGNER_OK) {
+                if(serr == SIGNER_ERR_NETWORK_MISMATCH) {
+                    hwp_send_error(f->seq, HWP_ERR_NETWORK_MISMATCH,
+                        "TxMeta coin_type != session coin_type");
+                    s_net_err_msg = "TX metadata network mismatch";
+                    s_sign_page = PAGE_SIGN_NET_ERR;
+                    with_view_model(
+                        w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
+                    for(int i = 0; i < 30 && s_sign_page != 0; i++) furi_delay_ms(100);
+                    if(s_sign_page == 0) break;
+                    s_sign_page = PAGE_SIGN_WAIT;
+                    with_view_model(
+                        w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
+                    orchard_signer_reset(&signer_ctx);
+                    break;
+                } else if(serr != SIGNER_OK) {
                     hwp_send_error(f->seq, HWP_ERR_BAD_FRAME, "Bad TX metadata");
                     orchard_signer_reset(&signer_ctx);
                     break;
@@ -557,6 +604,154 @@ static int32_t sign_worker_thread(void* ctx) {
             }
 
             hwp_send(f->seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
+            break;
+        }
+
+        case HWP_MSG_TX_TRANSPARENT_INPUT: {
+            // v3: transparent digest verification — wire-identical to TX_OUTPUT framing
+            if(f->payload_len < HWP_TX_OUTPUT_HEADER) {
+                hwp_send_error(f->seq, HWP_ERR_BAD_FRAME, "Transparent input too short");
+                break;
+            }
+            uint16_t input_index =
+                (uint16_t)f->payload[0] | ((uint16_t)f->payload[1] << 8);
+            uint16_t total_inputs =
+                (uint16_t)f->payload[2] | ((uint16_t)f->payload[3] << 8);
+            const uint8_t* t_data = f->payload + HWP_TX_OUTPUT_HEADER;
+            uint16_t t_data_len = f->payload_len - HWP_TX_OUTPUT_HEADER;
+
+            OrchardSignerError serr;
+
+            // First input (and we are still in RECEIVING_ACTIONS) → begin session
+            if(input_index == 0 && signer_ctx.state == SIGNER_RECEIVING_ACTIONS) {
+                serr = orchard_signer_begin_transparent(&signer_ctx, total_inputs, 0);
+                if(serr != SIGNER_OK) {
+                    hwp_send_error(f->seq, HWP_ERR_INVALID_STATE,
+                        "Cannot begin transparent");
+                    orchard_signer_reset(&signer_ctx);
+                    break;
+                }
+            }
+
+            // Sentinel: index == total → verify transparent digest
+            if(input_index == total_inputs) {
+                if(t_data_len != 32) {
+                    hwp_send_error(f->seq, HWP_ERR_BAD_FRAME,
+                        "Transparent sentinel must be 32 bytes");
+                    orchard_signer_reset(&signer_ctx);
+                    break;
+                }
+                serr = orchard_signer_verify_transparent(&signer_ctx, t_data);
+                if(serr == SIGNER_ERR_TRANSPARENT_MISMATCH) {
+                    hwp_send_error(f->seq, HWP_ERR_TRANSPARENT_DIGEST_MISMATCH,
+                        "Transparent digest mismatch");
+                    break;
+                } else if(serr != SIGNER_OK) {
+                    hwp_send_error(f->seq, HWP_ERR_INVALID_STATE,
+                        "Transparent verify failed");
+                    orchard_signer_reset(&signer_ctx);
+                    break;
+                }
+                hwp_send(f->seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
+                break;
+            }
+
+            // Normal input data
+            serr = orchard_signer_feed_transparent_input(
+                &signer_ctx, t_data, t_data_len);
+            if(serr != SIGNER_OK) {
+                HwpErrorCode code = (serr == SIGNER_ERR_BAD_STATE)
+                                        ? HWP_ERR_INVALID_STATE
+                                        : HWP_ERR_BAD_FRAME;
+                hwp_send_error(f->seq, code, "Bad transparent input");
+                orchard_signer_reset(&signer_ctx);
+                break;
+            }
+            hwp_send(f->seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
+            break;
+        }
+
+        case HWP_MSG_TX_TRANSPARENT_OUTPUT: {
+            // v3: transparent outputs for digest computation
+            if(f->payload_len < HWP_TX_OUTPUT_HEADER) {
+                hwp_send_error(f->seq, HWP_ERR_BAD_FRAME, "Transparent output too short");
+                break;
+            }
+            uint16_t output_index =
+                (uint16_t)f->payload[0] | ((uint16_t)f->payload[1] << 8);
+            uint16_t total_outputs =
+                (uint16_t)f->payload[2] | ((uint16_t)f->payload[3] << 8);
+            const uint8_t* t_data = f->payload + HWP_TX_OUTPUT_HEADER;
+            uint16_t t_data_len = f->payload_len - HWP_TX_OUTPUT_HEADER;
+
+            // Lazy: first output carries total_outputs — set it on the signer
+            if(output_index == 0 && signer_ctx.transparent_outputs_expected == 0) {
+                signer_ctx.transparent_outputs_expected = total_outputs;
+            }
+
+            OrchardSignerError serr = orchard_signer_feed_transparent_output(
+                &signer_ctx, t_data, t_data_len);
+            if(serr != SIGNER_OK) {
+                HwpErrorCode code = (serr == SIGNER_ERR_BAD_STATE)
+                                        ? HWP_ERR_INVALID_STATE
+                                        : HWP_ERR_BAD_FRAME;
+                hwp_send_error(f->seq, code, "Bad transparent output");
+                orchard_signer_reset(&signer_ctx);
+                break;
+            }
+            hwp_send(f->seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
+            break;
+        }
+
+        case HWP_MSG_TRANSPARENT_SIGN_REQ: {
+            // v3: on-device ECDSA signing for transparent inputs
+            if(f->payload_len < HWP_TX_OUTPUT_HEADER) {
+                hwp_send_error(f->seq, HWP_ERR_BAD_FRAME, "Transparent sign req too short");
+                break;
+            }
+            uint16_t input_index =
+                (uint16_t)f->payload[0] | ((uint16_t)f->payload[1] << 8);
+            const uint8_t* input_data = f->payload + HWP_TX_OUTPUT_HEADER;
+            uint16_t input_data_len = f->payload_len - HWP_TX_OUTPUT_HEADER;
+
+            if(!signer_ctx.transparent_verified) {
+                hwp_send_error(f->seq, HWP_ERR_INVALID_STATE,
+                    "Transparent not verified");
+                break;
+            }
+
+            // Compute per-input sighash on-device (ZIP-244 S.2)
+            uint8_t per_input_sighash[32];
+            zip244_transparent_per_input_sighash(
+                &signer_ctx.transparent_state,
+                input_index,
+                input_data,
+                input_data_len,
+                0x01, // SIGHASH_ALL
+                per_input_sighash);
+
+            // ECDSA sign with pre-derived transparent SK
+            uint8_t compact_sig[64];
+            if(secp256k1_ecdsa_sign_digest(w->t_sk, per_input_sighash, compact_sig) != 0) {
+                memzero(per_input_sighash, sizeof(per_input_sighash));
+                hwp_send_error(f->seq, HWP_ERR_SIGN_FAILED, "ECDSA sign failed");
+                break;
+            }
+
+            // DER-encode: der_sig_len[1] || der_sig[N] || sighash_type[1] || pubkey[33]
+            uint8_t der_sig[72];
+            size_t der_len = secp256k1_sig_to_der(compact_sig, der_sig);
+            memzero(compact_sig, sizeof(compact_sig));
+
+            uint8_t rsp[HWP_TRANSPARENT_SIGN_RSP_MAX];
+            rsp[0] = (uint8_t)der_len;
+            memcpy(rsp + 1, der_sig, der_len);
+            rsp[1 + der_len] = 0x01; // SIGHASH_ALL
+            memcpy(rsp + 1 + der_len + 1, w->t_pubkey, 33);
+
+            size_t rsp_len = 1 + der_len + 1 + 33;
+            hwp_send(f->seq, HWP_MSG_TRANSPARENT_SIGN_RSP, rsp, (uint16_t)rsp_len);
+            memzero(per_input_sighash, sizeof(per_input_sighash));
             break;
         }
 
@@ -1177,52 +1372,76 @@ void flipz_scene_1_enter(void* context) {
     // Sign mode
     if(view_mode == FlipZViewModeSign) {
         s_coin_label = (coin_type == CoinTypeZECOrchardTest) ? "TAZ" : "ZEC";
+        uint32_t derive_coin = (coin_type == CoinTypeZECOrchardTest) ? 1 : 133;
         CONFIDENTIAL uint8_t ask[32], ak_key[32], nk_key[32], rivk_key[32];
-        bool keys_ok = wallet_load_keys(
-            coin_type == CoinTypeZECOrchardTest, ask, ak_key, nk_key, rivk_key);
+        CONFIDENTIAL uint8_t t_sk[32];
+        uint8_t t_pubkey[33];
+        memzero(t_sk, 32);
+        memzero(t_pubkey, 33);
 
-        if(!keys_ok) {
-            s_sign_page = PAGE_SIGN_INIT;
+        s_sign_page = PAGE_SIGN_INIT;
+        with_view_model(
+            instance->view,
+            FlipZScene1Model * model,
+            {
+                model->mnemonic_only = true;
+                model->page = PAGE_SERIAL;
+            },
+            true);
+
+        // Seed is required for transparent (BIP-32) derivation.
+        // Even when orchard keys are cached, we must load the mnemonic.
+        char* mnemonic = malloc(TEXT_BUFFER_SIZE);
+        if(!mnemonic) {
+            s_sign_page = 0;
             with_view_model(
                 instance->view,
                 FlipZScene1Model * model,
                 {
                     model->mnemonic_only = true;
-                    model->page = PAGE_SERIAL;
+                    model->page = PAGE_MNEMONIC;
+                    model->mnemonic = "ERROR:,Out of memory";
                 },
                 true);
-
-            char* mnemonic = malloc(TEXT_BUFFER_SIZE);
-            if(!mnemonic || !wallet_load_mnemonic(mnemonic)) {
-                if(mnemonic) free(mnemonic);
-                s_sign_page = 0;
-                with_view_model(
-                    instance->view,
-                    FlipZScene1Model * model,
-                    {
-                        model->mnemonic_only = true;
-                        model->page = PAGE_MNEMONIC;
-                        model->mnemonic = "ERROR:,Load error";
-                    },
-                    true);
-                return;
-            }
-            uint8_t seed[64];
-            mnemonic_to_seed(mnemonic, passphrase_text, seed, 0);
-            memzero(mnemonic, TEXT_BUFFER_SIZE);
+            return;
+        }
+        if(!wallet_load_mnemonic(mnemonic)) {
             free(mnemonic);
+            s_sign_page = 0;
+            with_view_model(
+                instance->view,
+                FlipZScene1Model * model,
+                {
+                    model->mnemonic_only = true;
+                    model->page = PAGE_MNEMONIC;
+                    model->mnemonic = "ERROR:,Load error";
+                },
+                true);
+            return;
+        }
+        CONFIDENTIAL uint8_t seed[64];
+        mnemonic_to_seed(mnemonic, passphrase_text, seed, 0);
+        memzero(mnemonic, TEXT_BUFFER_SIZE);
+        free(mnemonic);
 
+        // Derive transparent spending key (BIP-32: m/44'/coin'/0'/0/0)
+        if(bip32_derive_transparent_sk(seed, derive_coin, t_sk, t_pubkey) != 0) {
+            memzero(t_sk, 32);
+            memzero(t_pubkey, 33);
+        }
+
+        bool keys_ok = wallet_load_keys(
+            coin_type == CoinTypeZECOrchardTest, ask, ak_key, nk_key, rivk_key);
+        if(!keys_ok) {
             CONFIDENTIAL uint8_t sk[32];
-            uint32_t derive_coin = (coin_type == CoinTypeZECOrchardTest) ? 1 : 133;
             orchard_derive_account_sk(seed, derive_coin, DERIV_ACCOUNT, sk);
             orchard_derive_keys(sk, ask, nk_key, rivk_key);
-            memzero(seed, 64);
             memzero(sk, 32);
-
             redpallas_derive_ak(ask, ak_key);
             wallet_save_keys(
                 coin_type == CoinTypeZECOrchardTest, ask, ak_key, nk_key, rivk_key);
         }
+        memzero(seed, 64);
 
         s_sign_page = PAGE_SIGN_WAIT;
         s_sign_confirmed = false;
@@ -1244,6 +1463,8 @@ void flipz_scene_1_enter(void* context) {
             memcpy(sctx->ak, ak_key, 32);
             memcpy(sctx->nk, nk_key, 32);
             memcpy(sctx->rivk, rivk_key, 32);
+            memcpy(sctx->t_sk, t_sk, 32);
+            memcpy(sctx->t_pubkey, t_pubkey, 33);
             sctx->testnet = (coin_type == CoinTypeZECOrchardTest);
             sctx->view = instance->view;
             instance->worker_thread = furi_thread_alloc_ex(
@@ -1254,6 +1475,7 @@ void flipz_scene_1_enter(void* context) {
         memzero(nk_key, 32);
         memzero(rivk_key, 32);
         memzero(ak_key, 32);
+        memzero(t_sk, 32);
         return;
     }
 

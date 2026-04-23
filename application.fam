@@ -11,7 +11,7 @@ App(
     fap_icon="flipz_10px.png",
     fap_private_libs=[
         Lib(
-            name="zcash",
+            name="libzcash-orchard-c",
             fap_include_paths=["include", "src"],
             cdefines=["ZORCHARD_NO_EXPLICIT_BZERO", "USE_PLATFORM_RNG=1"],
             sources=[
@@ -29,6 +29,8 @@ App(
                 "src/pallas.c",
                 "src/hash_stubs.c",
                 "src/redpallas.c",
+                "src/secp256k1.c",
+                "src/bip32.c",
                 "src/hwp.c",
                 "src/zip244.c",
                 "src/orchard_signer.c",
