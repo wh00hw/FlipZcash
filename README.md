@@ -1,6 +1,6 @@
 # FlipZcash — Zcash Orchard Shielded Wallet for Flipper Zero
 
-> **WARNING: This is a proof-of-concept. It has NOT been audited. Do not use with real funds.**
+> **WARNING: This is a proof-of-concept. It has NOT been audited.**
 
 FlipZcash is a Zcash Orchard shielded wallet running entirely on the Flipper Zero. It can generate shielded addresses, display them as QR codes, and sign transactions via USB serial — all using the Flipper's constrained hardware (STM32WB55, 64 MHz ARM Cortex-M4, 256 KB RAM).
 
@@ -13,6 +13,70 @@ https://x.com/nic_whr/status/2037306755844018441
 
 The first shielded transaction propagated from a Flipper Zero:
 https://x.com/nic_whr/status/2038744292336849279
+
+## Mainnet Broadcast
+
+The first ever Zcash mainnet Orchard-shielded spend signed offline by a Flipper Zero hardware wallet was broadcast on **2026-03-30**:
+
+| Field | Value |
+|---|---|
+| **Transaction hash** | `1c9eb6ca4ada67bf66452120d128ceacf2c0e21146de089e51694eb14db5466b` |
+| **Wallet birthday** | Zcash block height `3290915` |
+| **Network** | Zcash mainnet (`coin_type = 133`) |
+| **Pool** | Orchard shielded |
+| **Memo** | "First ever Zcash shielded TX signed offline by a Flipper Zero hardware wallet. Air-gapped, private, unstoppable. — wh00hw" |
+
+Captured evidence (in this repository):
+
+- [`screenshots/mainnet_pair.png`](screenshots/mainnet_pair.png) — `zipher-cli wallet pair-hardware --port /dev/ttyACM0 --birthday 3290915` succeeding (FVK exported from the Flipper, watch-only wallet imported into the companion).
+- [`screenshots/mainnet_broadcast.png`](screenshots/mainnet_broadcast.png) — full terminal session ending with `Transaction broadcast! TxID: 1c9eb6ca…5466b`.
+- [`screenshots/memo.png`](screenshots/memo.png) — Cypherscan "Decrypt Shielded Memo" view corroborating the same TxID and rendering the decrypted memo.
+
+For the full technical specification — primitives, derivation pipeline,
+HWP wire protocol, on-device sighash verification state machine, performance
+numbers, and security model — see [`IMPLEMENTATION.md`](IMPLEMENTATION.md).
+
+## Architecture
+
+FlipZcash uses a **delegated-signing** model. The signing work is split between
+the device and a companion application (the Rust SDK
+[`zcash-hw-wallet-sdk`](https://github.com/wh00hw/zcash-hw-wallet-sdk),
+typically driven by `zipher-cli`):
+
+```
+┌──────────────────────┐                    ┌──────────────────────────┐
+│     Flipper Zero     │                    │     Companion App        │
+│                      │                    │                          │
+│  Holds:              │   FVK export       │   Holds: FVK             │
+│  - ask  (NEVER       │ ─────────────────> │     (ak, nk, rivk)       │
+│         leaves)      │                    │   (watch-only)           │
+│  - nk, rivk, fvk     │   HWP frames       │                          │
+│  - transparent SK    │ <───────────────── │   Does:                  │
+│    (session-cached)  │                    │   - blockchain sync      │
+│                      │   sighash + alpha  │   - PCZT construction    │
+│  Does:               │ <───────────────── │   - Halo2 proof gen      │
+│  - on-device ZIP-244 │                    │   - signature injection  │
+│    sighash verify    │   sig + rk         │   - broadcast            │
+│  - user confirmation │ ─────────────────> │                          │
+│  - RedPallas signing │                    │                          │
+│  - secp256k1 ECDSA   │                    │                          │
+│    (transparent)     │                    │                          │
+└──────────────────────┘                    └──────────────────────────┘
+```
+
+The spending key `ask` never leaves the device. The companion only ever
+holds the Full Viewing Key, which lets it watch the chain and assemble
+transactions but cannot authorize a spend. In Orchard, only the RedPallas
+spend-authorization signature requires `ask`; everything else (Halo2 proof,
+nullifier derivation, value commitment, note encryption, binding signature)
+can be computed from the FVK.
+
+On-device sighash verification is enforced as a library invariant:
+`orchard_signer_sign()` in `lib/libzcash-orchard-c/src/orchard_signer.c`
+refuses to run unless the device has independently recomputed the
+ZIP-244 sighash from the streamed action data and matched it against the
+companion's expected value. A buggy or hostile firmware port cannot bypass
+the check because it lives in the C library, not in device-specific code.
 
 ## Acknowledgments
 
@@ -129,12 +193,36 @@ FlipZcash/
   .github/workflows/build.yml  CI: build the FAP on push / pull request
 ```
 
+## Comparison with Other Zcash Hardware Wallets
+
+| | **FlipZcash** | **`hhanh00/zcash-ledger`** | **Zondax `ledger-zcash`** | **Keystone 3 Pro × Zashi** |
+|---|---|---|---|---|
+| Device | Flipper Zero (STM32WB55) | Ledger Nano S+/X | Ledger Nano S+/X/Stax | Keystone 3 Pro (MH1903) |
+| Pools supported | Orchard + transparent | Sapling + Orchard | Sapling + transparent | Orchard + transparent |
+| License | MIT | Apache-2.0 | Apache-2.0 | MIT |
+| Source language | C (plain C11) | C (BOLOS-bound) | C (BOLOS-bound) | Rust (vendored librustzcash) |
+| Reusable as a library | **Yes** (`libzcash-orchard-c` is vendor-neutral, MIT, plain C) | No (BOLOS-coupled) | No (BOLOS-coupled) | No (Keystone-3-coupled) |
+| Distribution | Sideload (Unleashed firmware FAP) | Sideload (Ledger sideload, not in Ledger Live) | Awaiting Ledger Live release | Shipped with Keystone 3 Pro firmware |
+| On-device sighash verification | ✅ library-enforced invariant | Yes (firmware-side) | Yes (firmware-side) | Yes (firmware-side) |
+| Wire protocol | HWP (binary, CRC-16/CCITT, 14 msg types) | APDU (Ledger BOLOS) | APDU (Ledger BOLOS) | QR codes (UR-encoded PCZT) |
+| Companion | `zipher-cli` (Rust, open) | YWallet | (Sideload tool) | Zashi mobile (required) |
+| Audit | ❌ | ❌ at original ZCG approval; ZecSec audit performed later | Audit funded inside grant | ❌ at grant approval; M2 of OneKey-style roadmap |
+| Mainnet shielded broadcast | ✅ tx `1c9eb6ca…5466b` (2026-03-30) | ✅ | (Sapling only) | ✅ |
+
+FlipZcash's distinguishing technical contribution is not the Flipper Zero
+firmware itself but the underlying
+[`libzcash-orchard-c`](https://github.com/wh00hw/libzcash-orchard-c) library:
+the first portable, vendor-neutral, MIT-licensed plain-C implementation of
+the Orchard primitives. The same library powers an ESP32-S2 reference port
+([`zcash-hw-wallet-esp32`](https://github.com/wh00hw/zcash-hw-wallet-esp32))
+without modification, demonstrating cross-MCU portability.
+
 ## Disclaimer
 
 This software is a **proof-of-concept** born from an experimental exploration of Zcash Orchard on embedded hardware. It has **not been audited** by any security firm. The cryptographic primitives were implemented from scratch in C and, while tested against official test vectors, may contain subtle bugs.
 
-**Do not use this software to manage real funds.** Use at your own risk.
+**Use at your own risk.** 
 
 ## License
 
-MIT
+MIT — see [`LICENSE`](LICENSE).

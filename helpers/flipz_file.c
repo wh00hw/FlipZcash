@@ -117,9 +117,7 @@ bool flipz_save_qrfile(
     const char* qr_msg_content,
     const char* file_name) {
     char buf[200] = {0};
-    strcpy(buf, TEXT_QRFILE);
-    strcat(buf, qr_msg_prefix);
-    strcat(buf, qr_msg_content);
+    snprintf(buf, sizeof(buf), "%s%s%s", TEXT_QRFILE, qr_msg_prefix, qr_msg_content);
     return flipz_file_write(file_name, buf);
 }
 

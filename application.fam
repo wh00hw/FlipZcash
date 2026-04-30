@@ -49,7 +49,7 @@ App(
     ],
     fap_category="Tools",
     fap_author="wh00hw",
-    fap_weburl="https://github.com/nicksoni-brave/FlipBIP",
+    fap_weburl="https://github.com/wh00hw/FlipZcash",
     fap_version=(0, 3),
     fap_description="Zcash Orchard shielded wallet for Flipper Zero",
 )
