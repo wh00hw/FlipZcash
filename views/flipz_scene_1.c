@@ -49,6 +49,7 @@
 #define PAGE_SIGN_AMOUNT 11
 #define PAGE_SIGN_NET_ERR 12
 #define PAGE_SIGN_DONE  8
+#define PAGE_SIGN_REVIEW_OUTPUT 13   /* per-output recipient+value review */
 
 struct FlipZScene1 {
     View* view;
@@ -84,6 +85,12 @@ static const char* s_net_err_msg = "";
 static volatile bool s_sign_confirmed = false;
 static volatile bool s_sign_cancelled = false;
 static volatile bool s_sign_done = false;
+
+// Per-output review state (PAGE_SIGN_REVIEW_OUTPUT)
+static char s_review_ua[200];          /* full Bech32m UA for the output */
+static uint64_t s_review_value = 0;     /* zatoshis */
+static uint16_t s_review_index = 0;     /* 0-based */
+static uint16_t s_review_total = 0;
 
 // Mnemonic display
 #define DISP_LINE_COUNT 6
@@ -569,6 +576,16 @@ static int32_t sign_worker_thread(void* ctx) {
                         w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
                     orchard_signer_reset(&signer_ctx);
                     break;
+                } else if(serr == SIGNER_ERR_SAPLING_NOT_EMPTY) {
+                    hwp_send_error(f->seq, HWP_ERR_SAPLING_NOT_EMPTY,
+                        "Sapling components not allowed (Orchard-only)");
+                    orchard_signer_reset(&signer_ctx);
+                    break;
+                } else if(serr == SIGNER_ERR_TOO_MANY_ACTIONS) {
+                    hwp_send_error(f->seq, HWP_ERR_BAD_FRAME,
+                        "Transaction has more outputs than the device can display");
+                    orchard_signer_reset(&signer_ctx);
+                    break;
                 } else if(serr != SIGNER_OK) {
                     hwp_send_error(f->seq, HWP_ERR_BAD_FRAME, "Bad TX metadata");
                     orchard_signer_reset(&signer_ctx);
@@ -581,10 +598,87 @@ static int32_t sign_worker_thread(void* ctx) {
                     orchard_signer_reset(&signer_ctx);
                     break;
                 }
+
+                /* Per-output review BEFORE the lib's verify() runs. The lib
+                 * refuses to advance to VERIFIED unless every captured
+                 * action has been confirmed via orchard_signer_confirm_action;
+                 * we drive the screen + button loop here so by the time we
+                 * call verify() the invariant is satisfied. */
+                bool all_confirmed = true;
+                const char* hrp = w->testnet ? "utest" : "u";
+                s_review_total = signer_ctx.actions_received;
+                for(uint16_t i = 0; i < signer_ctx.actions_received; i++) {
+                    uint8_t recipient[43];
+                    uint64_t value;
+                    OrchardSignerError gerr = orchard_signer_get_action_display(
+                        &signer_ctx, i, recipient, &value);
+                    if(gerr != SIGNER_OK) {
+                        all_confirmed = false;
+                        break;
+                    }
+                    int n = orchard_encode_ua_raw(
+                        recipient, recipient + 11, hrp,
+                        s_review_ua, sizeof(s_review_ua));
+                    if(n <= 0) {
+                        all_confirmed = false;
+                        break;
+                    }
+                    s_review_value = value;
+                    s_review_index = i;
+                    s_sign_confirmed = false;
+                    s_sign_cancelled = false;
+                    s_sign_page = PAGE_SIGN_REVIEW_OUTPUT;
+                    with_view_model(
+                        w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
+
+                    /* Block until OK / Cancel / scene-exit. */
+                    while(!s_sign_confirmed && !s_sign_cancelled && s_sign_page != 0) {
+                        furi_delay_ms(100);
+                    }
+                    if(s_sign_page == 0) {
+                        all_confirmed = false;
+                        break;
+                    }
+                    if(!s_sign_confirmed) {
+                        all_confirmed = false;
+                        break;
+                    }
+                    OrchardSignerError cerr = orchard_signer_confirm_action(&signer_ctx, i);
+                    if(cerr != SIGNER_OK) {
+                        all_confirmed = false;
+                        break;
+                    }
+                }
+                /* Wipe the staging buffer — recipient is not secret per se
+                 * but no reason to leave it lying in BSS once shown. */
+                memzero(s_review_ua, sizeof(s_review_ua));
+                s_review_value = 0;
+
+                if(!all_confirmed) {
+                    hwp_send_error(f->seq, HWP_ERR_USER_CANCELLED,
+                        "User cancelled per-output review");
+                    s_sign_page = PAGE_SIGN_WAIT;
+                    with_view_model(
+                        w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
+                    orchard_signer_reset(&signer_ctx);
+                    break;
+                }
+                /* Back to "verifying" indicator while we run the sighash check. */
+                s_sign_page = PAGE_SIGN_INIT;
+                with_view_model(
+                    w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
+
                 serr = orchard_signer_verify(&signer_ctx, txo.output_data);
                 if(serr == SIGNER_ERR_SIGHASH_MISMATCH) {
                     hwp_send_error(f->seq, HWP_ERR_SIGHASH_MISMATCH,
                         "Device sighash != companion sighash");
+                    orchard_signer_reset(&signer_ctx);
+                    break;
+                } else if(serr == SIGNER_ERR_ACTION_NOT_CONFIRMED) {
+                    /* Should be unreachable (loop above confirmed each), but
+                     * surface it cleanly if it ever fires. */
+                    hwp_send_error(f->seq, HWP_ERR_INVALID_STATE,
+                        "internal: action confirmation lost");
                     orchard_signer_reset(&signer_ctx);
                     break;
                 } else if(serr != SIGNER_OK) {
@@ -593,9 +687,32 @@ static int32_t sign_worker_thread(void* ctx) {
                     break;
                 }
             } else {
-                // Action data (index 0..N-1)
-                serr = orchard_signer_feed_action(
-                    &signer_ctx, txo.output_data, txo.output_data_len);
+                /* Action data (index 0..N-1) — v4 payload: 820 action bytes
+                 * + 43 recipient + 8 value + 32 rseed. The note plaintext
+                 * lets the lib recompute cmx and reject recipient
+                 * substitution before any data is displayed to the user. */
+                HwpActionV4 av4;
+                if(!hwp_parse_action_v4(txo.output_data, txo.output_data_len, &av4)) {
+                    hwp_send_error(f->seq, HWP_ERR_BAD_FRAME,
+                        "Action payload must be 903 bytes (820 + 43 + 8 + 32)");
+                    orchard_signer_reset(&signer_ctx);
+                    break;
+                }
+                serr = orchard_signer_feed_action_with_note(
+                    &signer_ctx, av4.action, HWP_ACTION_DATA_SIZE,
+                    av4.recipient, av4.value, av4.rseed);
+                if(serr == SIGNER_ERR_NOTE_COMMITMENT_MISMATCH) {
+                    hwp_send_error(f->seq, HWP_ERR_NOTE_COMMITMENT_MISMATCH,
+                        "Action cmx does not commit to claimed recipient/value/rseed");
+                    orchard_signer_reset(&signer_ctx);
+                    break;
+                }
+                if(serr == SIGNER_ERR_TOO_MANY_ACTIONS) {
+                    hwp_send_error(f->seq, HWP_ERR_BAD_FRAME,
+                        "Transaction has more outputs than the device can display");
+                    orchard_signer_reset(&signer_ctx);
+                    break;
+                }
                 if(serr != SIGNER_OK) {
                     hwp_send_error(f->seq, HWP_ERR_BAD_FRAME, "Bad action data");
                     orchard_signer_reset(&signer_ctx);
@@ -1071,6 +1188,59 @@ void flipz_scene_1_draw(Canvas* canvas, FlipZScene1Model* model) {
         canvas_draw_str_aligned(
             canvas, 64, 46, AlignCenter, AlignCenter, "companion broadcast app");
 
+    } else if(s_sign_page == PAGE_SIGN_REVIEW_OUTPUT) {
+        /* Per-output review screen: shows the recipient (UA) of the
+         * Orchard output the device just verified the cmx for, plus its
+         * value. The user must press OK to call orchard_signer_confirm_action
+         * — without confirmation the lib state machine refuses to advance
+         * to VERIFIED, and orchard_signer_sign() will then refuse with
+         * NOT_VERIFIED. Per-action enforcement, not a UI nicety. */
+        canvas_set_font(canvas, FontPrimary);
+        char hdr[24];
+        snprintf(hdr, sizeof(hdr), "Output %u/%u",
+                 (unsigned)(s_review_index + 1), (unsigned)s_review_total);
+        canvas_draw_str_aligned(canvas, 64, 2, AlignCenter, AlignTop, hdr);
+
+        canvas_set_font(canvas, FontSecondary);
+        /* Wrap the UA into 25-char rows. Most Orchard-only UAs are ~106
+         * chars, so they fit in 5 lines. */
+        {
+            const int chars_per_line = 25;
+            const int y_start = 14;
+            const int line_h = 8;
+            const int max_lines = 4;   /* leave room for value + footer */
+            size_t len = strlen(s_review_ua);
+            for(int row = 0; row < max_lines && (size_t)(row * chars_per_line) < len; row++) {
+                char line[26];
+                size_t offset = row * chars_per_line;
+                size_t n = len - offset;
+                if(n > (size_t)chars_per_line) n = chars_per_line;
+                /* For the last visible row, replace the tail with "..."
+                 * if more chars remain. */
+                if(row == max_lines - 1 && (offset + n) < len) {
+                    if(n > 3) n -= 3;
+                    memcpy(line, s_review_ua + offset, n);
+                    memcpy(line + n, "...", 3);
+                    line[n + 3] = '\0';
+                } else {
+                    memcpy(line, s_review_ua + offset, n);
+                    line[n] = '\0';
+                }
+                canvas_draw_str_aligned(
+                    canvas, 64, y_start + row * line_h, AlignCenter, AlignTop, line);
+            }
+        }
+        {
+            char vbuf[32];
+            snprintf(vbuf, sizeof(vbuf), "%lu.%08lu %s",
+                     (unsigned long)(s_review_value / 100000000ULL),
+                     (unsigned long)(s_review_value % 100000000ULL),
+                     s_coin_label);
+            canvas_draw_str_aligned(canvas, 64, 48, AlignCenter, AlignTop, vbuf);
+        }
+        canvas_draw_str_aligned(
+            canvas, 64, 58, AlignCenter, AlignCenter, "[>] Confirm  [<] Cancel");
+
     } else if(s_sign_page == PAGE_SIGN_ADDR) {
         canvas_set_font(canvas, FontPrimary);
         canvas_draw_str_aligned(
@@ -1184,6 +1354,8 @@ bool flipz_scene_1_input(InputEvent* event, void* context) {
                         model->addr_subpage = 1;
                     } else if(s_sign_page == PAGE_SIGN_ADDR) {
                         s_sign_page = PAGE_SIGN_AMOUNT;
+                    } else if(s_sign_page == PAGE_SIGN_REVIEW_OUTPUT) {
+                        s_sign_confirmed = true;
                     }
                 },
                 true);
@@ -1196,6 +1368,8 @@ bool flipz_scene_1_input(InputEvent* event, void* context) {
                     if(model->page == PAGE_ADDR_ZEC) {
                         model->addr_subpage = 1;
                     } else if(s_sign_page == PAGE_SIGN_AMOUNT) {
+                        s_sign_confirmed = true;
+                    } else if(s_sign_page == PAGE_SIGN_REVIEW_OUTPUT) {
                         s_sign_confirmed = true;
                     }
                 },
@@ -1212,6 +1386,8 @@ bool flipz_scene_1_input(InputEvent* event, void* context) {
                         s_sign_cancelled = true;
                     } else if(s_sign_page == PAGE_SIGN_AMOUNT) {
                         s_sign_page = PAGE_SIGN_ADDR;
+                    } else if(s_sign_page == PAGE_SIGN_REVIEW_OUTPUT) {
+                        s_sign_cancelled = true;
                     }
                 },
                 true);
