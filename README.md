@@ -71,12 +71,14 @@ spend-authorization signature requires `ask`; everything else (Halo2 proof,
 nullifier derivation, value commitment, note encryption, binding signature)
 can be computed from the FVK.
 
-On-device sighash verification is enforced as a library invariant:
-`orchard_signer_sign()` in `lib/libzcash-orchard-c/src/orchard_signer.c`
-refuses to run unless the device has independently recomputed the
-ZIP-244 sighash from the streamed action data and matched it against the
-companion's expected value. A buggy or hostile firmware port cannot bypass
-the check because it lives in the C library, not in device-specific code.
+**No-blind-signing as a library invariant.** Four checkpoints, all enforced by the C library `lib/libzcash-orchard-c/`, gate every signature:
+
+1. **Sapling-component lockout** — `orchard_signer_feed_meta()` aborts with `SIGNER_ERR_SAPLING_NOT_EMPTY` unless `sapling_digest` equals the ZIP-244 empty-bundle constant. The Flipper-Zcash wallet is Orchard-only by design, so this is a structural fit.
+2. **Per-action NoteCommitment recomputation** — `orchard_signer_feed_action_with_note()` recomputes `cmx = Extract_P(NoteCommit(g_d, pk_d, value, rho, psi))` from the unencrypted note plaintext (recipient, value, rseed) the companion declares, and rejects mismatches with `SIGNER_ERR_NOTE_COMMITMENT_MISMATCH` before any data is shown to the user. Closes recipient substitution.
+3. **Per-output user confirmation** — `orchard_signer_verify()` refuses to advance to `SIGNER_VERIFIED` unless every captured action has been explicitly confirmed via `orchard_signer_confirm_action()`. The Flipper drives a dedicated review scene (`PAGE_SIGN_REVIEW_OUTPUT`) for each output, displaying the recipient's Bech32m Unified Address and value, requiring an OK press to confirm and Back/Cancel to abort.
+4. **ZIP-244 sighash recomputation** — `orchard_signer_verify()` recomputes the full v5 shielded sighash on-device from header + transparent + sapling + orchard digests and constant-time-matches against the companion's value (`SIGNER_ERR_SIGHASH_MISMATCH`).
+
+`orchard_signer_sign()` refuses to produce a signature unless the state machine is in `VERIFIED`. A buggy or hostile firmware port cannot bypass any of the four checks because they live in the C library, not in device-specific code. The Flipper firmware is responsible only for driving the UI loop that satisfies invariant (3); it does not make signing-policy decisions.
 
 ## Acknowledgments
 
@@ -95,8 +97,11 @@ FlipZcash relies on two companion libraries, both purpose-built for this project
 - **Generate wallet** — BIP-39 mnemonic (12/18/24 words) with optional passphrase
 - **Import wallet** — Word-by-word mnemonic entry with autocomplete
 - **Shielded address** — Orchard Unified Address with QR code display
-- **USB Serial Signer** — Sign transactions via HWP v3 protocol with on-device confirmation (recipient, amount, fee)
+- **USB Serial Signer** — Sign transactions via HWP v4 protocol; each output's recipient (UA) and value is shown on the device and must be confirmed individually before signing
 - **Shielded sighash verification** — On-device staged ZIP-244 verification: the companion sends transaction metadata and action data individually, the device hashes them incrementally and compares the computed sighash against the companion's before allowing any Orchard signature
+- **Per-action NoteCommitment verification** — Device recomputes the Sinsemilla-based `cmx` for every Orchard action from the unencrypted note plaintext (recipient, value, rseed) the companion declares, and rejects recipient-substitution attempts with `HWP_ERR_NOTE_COMMITMENT_MISMATCH` before any output is displayed
+- **Per-output review scene** — `PAGE_SIGN_REVIEW_OUTPUT` displays the full Bech32m Unified Address (wrapped on the LCD) and value of every Orchard output before signing; OK confirms, Back cancels. The libzcash signer state machine refuses to sign without an explicit confirm for every output
+- **Sapling-component lockout** — Device enforces `sapling_digest` equal to the ZIP-244 empty-bundle constant; PCZTs containing Sapling spends or outputs are rejected before any orchard data is hashed
 - **Transparent input support** — On-device BLAKE2b computation of the ZIP-244 transparent txid digest (prevouts, sequences, outputs) from the wire data sent by the companion, matched against the transparent digest embedded in the transaction metadata
 - **Transparent ECDSA signing** — On-device per-input sighash computation (ZIP-244 S.2) and secp256k1 ECDSA signing with RFC-6979 deterministic nonces, DER-encoded response; no private key ever leaves the device
 - **Network discrimination** — Companion advertises its coin type in `FVK_REQ`; the device enforces that the session coin type, the transaction metadata coin type, and the recipient address prefix (`u` / `utest`) all agree before signing
@@ -116,16 +121,23 @@ The signing flow implements the staged verification protocol defined by `zcash-h
    - `TX_TRANSPARENT_INPUT(i, num_inputs, input_data)` × num_inputs — prevout_hash, index, sequence, value, script_pubkey
    - `TX_TRANSPARENT_OUTPUT(j, num_outputs, output_data)` × num_outputs — value, script_pubkey
    - `TX_TRANSPARENT_INPUT(num_inputs, num_inputs, expected_digest)` — sentinel; the device computes the ZIP-244 transparent digest incrementally and checks it against both the sentinel value and the digest in the transaction metadata
-5. **Orchard actions** — `TX_OUTPUT(i, N, action_data)` × N (820 bytes each: cv_net, nullifier, rk, cmx, ephemeral_key, enc_ciphertext, out_ciphertext)
-6. **Shielded sighash verification** — `TX_OUTPUT(N, N, sighash)` sentinel; the device compares the computed sighash with the companion's
-7. **User confirmation** — Device displays recipient, amount, fee; user approves or cancels
+5. **Orchard actions (v4)** — `TX_OUTPUT(i, N, action_data)` × N (903 bytes each: 820-byte ZIP-244 action followed by `recipient[43] || value[8 LE] || rseed[32]`). For each action the device recomputes the Sinsemilla-based note commitment from the trailing plaintext and constant-time-compares against the cmx field of the encrypted action; mismatches abort with `HWP_ERR_NOTE_COMMITMENT_MISMATCH` before any user-visible step.
+6. **Per-output review** — Before the sentinel sighash is verified, the Flipper iterates the captured per-action display info, encodes each recipient as a Bech32m UA via `orchard_encode_ua_raw`, and shows it together with the value on `PAGE_SIGN_REVIEW_OUTPUT`. The user presses OK (or Right) to confirm, Back (or Left) to cancel. Cancellation aborts the session with `HWP_ERR_USER_CANCELLED`. Each confirm calls `orchard_signer_confirm_action(idx)`; without all confirms the libzcash signer refuses to advance.
+7. **Shielded sighash verification** — `TX_OUTPUT(N, N, sighash)` sentinel; the device verifies all per-action confirmations are recorded, compares the computed sighash with the companion's, and transitions to `SIGNER_VERIFIED`
 8. **Orchard signing** — `SIGN_REQ` × (spends to authorize) → `orchard_signer_sign()` (enforces verification invariant) → `SIGN_RSP(sig || rk)`
 9. **Transparent signing** *(optional)* — For each transparent input, `TRANSPARENT_SIGN_REQ(input_index, total_inputs, input_data)`:
    - Device computes the per-input sighash from its cached transparent state (ZIP-244 S.2: `BLAKE2b("ZTxIdTranspaHash", hash_type || prevouts || amounts || scripts || sequence || outputs || txin_sig)`)
    - Device signs the digest with secp256k1 ECDSA (RFC-6979 deterministic nonce, low-S normalized)
    - Response: `TRANSPARENT_SIGN_RSP(der_sig_len || der_sig || sighash_type || pubkey33)`
 
-The `OrchardSignerCtx` state machine in libzcash-orchard-c guarantees at the library level that signatures cannot be produced without completing the relevant verification step: Orchard signatures require `VERIFIED` state, and `TRANSPARENT_SIGN_REQ` is rejected unless `transparent_verified` is set.
+The `OrchardSignerCtx` state machine in libzcash-orchard-c guarantees at the library level that signatures cannot be produced without completing every verification step:
+
+- `feed_meta()` rejects `sapling_digest ≠ empty-bundle constant`
+- `feed_action_with_note()` rejects `cmx ≠ Sinsemilla-NoteCommit(declared note plaintext)`
+- `verify()` requires every action to have been explicitly confirmed via `confirm_action()`
+- `verify()` recomputes the full ZIP-244 sighash on-device and refuses on mismatch
+- `sign()` refuses unless `state == VERIFIED`
+- `TRANSPARENT_SIGN_REQ` is rejected unless `transparent_verified` is set
 
 ### Key derivation
 
@@ -204,6 +216,8 @@ FlipZcash/
 | Reusable as a library | **Yes** (`libzcash-orchard-c` is vendor-neutral, MIT, plain C) | No (BOLOS-coupled) | No (BOLOS-coupled) | No (Keystone-3-coupled) |
 | Distribution | Sideload (Unleashed firmware FAP) | Sideload (Ledger sideload, not in Ledger Live) | Awaiting Ledger Live release | Shipped with Keystone 3 Pro firmware |
 | On-device sighash verification | ✅ library-enforced invariant | Yes (firmware-side) | Yes (firmware-side) | Yes (firmware-side) |
+| Per-action NoteCommitment recomputation | ✅ Sinsemilla NoteCommit on-device, KAT vs librustzcash | Yes (firmware-side) | Yes (firmware-side) | Yes (firmware-side) |
+| Per-output user confirmation as library invariant | ✅ `verify()` refuses without `confirm_action()` per output; UI cannot bypass | Firmware convention | Firmware convention | Firmware convention |
 | Wire protocol | HWP (binary, CRC-16/CCITT, 14 msg types) | APDU (Ledger BOLOS) | APDU (Ledger BOLOS) | QR codes (UR-encoded PCZT) |
 | Companion | `zipher-cli` (Rust, open) | YWallet | (Sideload tool) | Zashi mobile (required) |
 | Audit | ❌ | ❌ at original ZCG approval; ZecSec audit performed later | Audit funded inside grant | ❌ at grant approval; M2 of OneKey-style roadmap |
