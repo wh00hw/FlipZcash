@@ -128,7 +128,7 @@ CRC-16/CCITT (poly `0x1021`, init `0xFFFF`) over the entire header + payload.
 | `SIGN_REQ (0x05)` | C→F | `sighash[32] || alpha[32] || amount[8] || fee[8] || rlen[1] || recipient[N]` | Request RedPallas signature for an action |
 | `SIGN_RSP (0x06)` | F→C | `sig[64] || rk[32]` | RedPallas signature + randomized key |
 | `ERROR (0x07)` | either | `code[1] || message[N]` | Explicit error frame |
-| `TX_OUTPUT (0x08)` | C→F | `idx_le[2] || total_le[2] || data[N]` | Stream tx metadata (idx 0xFFFF) / actions / sighash sentinel |
+| `TX_OUTPUT (0x08)` | C→F | `idx_le[2] || total_le[2] || data[N]` | Stream tx metadata (idx `0xFFFF`, 129 B) / v4 actions (idx 0..N-1, 903 B = 820 B ZIP-244 action + 43 B recipient + 8 B value + 32 B rseed) / sighash sentinel (idx N, 32 B) |
 | `TX_OUTPUT_ACK (0x09)` | F→C | `idx_le[2]` | Per-frame acknowledgement |
 | `ABORT (0x0A)` | C→F | empty | Cancel session, reset state |
 | `TX_TRANSPARENT_INPUT (0x0B)` | C→F | `idx_le[2] || total_le[2] || data[N]` | Stream transparent inputs / digest sentinel |
@@ -141,55 +141,104 @@ CRC-16/CCITT (poly `0x1021`, init `0xFFFF`) over the entire header + payload.
 | Code | Meaning |
 |------|---------|
 | `0x05` | Network mismatch (session coin type ≠ tx metadata coin type ≠ recipient prefix) |
-| `0x0A` | Session-level abort |
+| `0x06` | User cancelled during per-output review |
+| `0x09` | Sighash mismatch (device-recomputed sighash ≠ companion-supplied sighash) |
+| `0x0A` | Session-level abort / invalid state |
 | `0x0B` | Transparent digest mismatch (recomputed digest ≠ companion-supplied digest) |
-| Other | Sighash mismatch / state-machine violation / parser error |
+| `0x0C` | Sapling-not-empty (`sapling_digest` ≠ ZIP-244 empty-bundle constant — Orchard-only invariant violation) |
+| `0x0D` | NoteCommitment mismatch (device-recomputed `cmx` ≠ `action.cmx` — recipient-substitution attempt) |
+| `0x0E` | Recipient mismatch (`SIGN_REQ.recipient` UA does not match any confirmed action) |
 
 The version byte on the wire is `0x02`; the device accepts both `0x01`
-(legacy) and `0x02` inbound and always emits `0x02` outbound.
+(legacy) and `0x02` inbound and always emits `0x02` outbound. HWP v3 added
+the transparent flow (`TX_TRANSPARENT_INPUT/OUTPUT`, `TRANSPARENT_SIGN_REQ/RSP`)
+and HWP v4 extended the Orchard `TX_OUTPUT` payload from 820 to 903 bytes
+to carry the unencrypted note plaintext required for on-device cmx
+recomputation.
 
 ---
 
-## 5. On-Device ZIP-244 Sighash Verification
+## 5. On-Device Signing Invariants (Library-enforced)
 
 The signing path is gated by a state machine implemented inside the
 cryptographic library (`OrchardSignerCtx` in
 `lib/libzcash-orchard-c/src/orchard_signer.c`). Any caller — FlipZcash,
-the ESP32-S2 reference port, or a future third-party wallet — gets the
-verification check for free and cannot bypass it:
+the ESP32-S2 reference port, or a future third-party wallet — gets all
+verification checks for free and cannot bypass them. Four checkpoints
+compose the "no blind signing" guarantee; all four must pass before
+`orchard_signer_sign()` will produce a RedPallas signature.
 
 ```
                            ┌────────────────────────┐
                            │       SIGNER_INIT      │
                            └────────────┬───────────┘
                                         │ feed_meta()
+                                        │  ① sapling_digest must equal
+                                        │     ZIP-244 empty-bundle constant
+                                        │     else SIGNER_ERR_SAPLING_NOT_EMPTY
                                         ▼
                            ┌────────────────────────┐
                            │   SIGNER_HAS_META      │
                            └────────────┬───────────┘
-                                        │ feed_action() × N
+                                        │ feed_action_with_note() × N
+                                        │  ② cmx = Extract_P(NoteCommit(
+                                        │       g_d, pk_d, v, ρ, ψ))
+                                        │     recomputed on-device from
+                                        │     (recipient, value, rseed);
+                                        │     mismatch ⇒
+                                        │     SIGNER_ERR_NOTE_COMMITMENT_MISMATCH
+                                        │  (recipient, value) captured
+                                        │  with confirmed=false flag
                                         ▼
                            ┌────────────────────────┐
                            │  SIGNER_HAS_ACTIONS    │
                            └────────────┬───────────┘
+                                        │ confirm_action(i) × N
+                                        │  ③ firmware drives per-output
+                                        │     review UI, sets confirmed=true
+                                        │     once user OKs the displayed
+                                        │     (UA, value); missing confirm ⇒
+                                        │     SIGNER_ERR_ACTION_NOT_CONFIRMED
+                                        ▼
+                           ┌────────────────────────┐
+                           │  ACTIONS_CONFIRMED     │
+                           └────────────┬───────────┘
                                         │ verify(expected_sighash)
-                                        │   compares device sighash
-                                        │   to expected, ct-equal
+                                        │  ④ full ZIP-244 v5 sighash
+                                        │     recomputed on-device from
+                                        │     header + transparent + sapling
+                                        │     + orchard digests; constant-time
+                                        │     compared to companion's sighash;
+                                        │     mismatch ⇒
+                                        │     SIGNER_ERR_SIGHASH_MISMATCH
                                         ▼
                            ┌────────────────────────┐
                            │   SIGNER_VERIFIED      │ ──── sign(): only here
                            └────────────────────────┘
 ```
 
-`orchard_signer_sign()` rejects the call unless the state has reached
-`SIGNER_VERIFIED`. A buggy or hostile firmware cannot bypass the check
-because the rejection is in the C library, not in device-specific code.
+`orchard_signer_sign()` rejects the call with `NOT_VERIFIED` unless the
+state has reached `SIGNER_VERIFIED`. A buggy or hostile firmware port
+cannot bypass any of the four checks because they live in the C library,
+not in device-specific code. The firmware is responsible only for
+driving the per-output review UI that satisfies invariant ③; it does
+not make signing-policy decisions.
+
+`SIGN_REQ.recipient` cross-check (defense-in-depth): when the
+companion sends the final `SIGN_REQ`, the device decodes the advertised
+UA via `orchard_decode_ua_orchard_receiver` and compares it in
+constant time against the recipients of the confirmed actions. A
+hostile companion that lies to its host UI is caught here with
+`HWP_ERR_RECIPIENT_MISMATCH (0x0E)`.
 
 Transparent signing follows the same pattern with a separate
 `transparent_verified` flag set after the device recomputes the
 ZIP-244 transparent txid digest from the streamed inputs/outputs and
 matches it against both the sentinel digest and the digest in the
-transaction metadata.
+transaction metadata. The per-input sighash (ZIP-244 §S.2: amounts,
+scripts, txin_sig digests) is also computed on-device before each
+ECDSA signature is emitted; no part of any signed digest is taken on
+faith from the companion.
 
 ---
 
@@ -221,23 +270,43 @@ transaction metadata.
      C → F: TX_TRANSPARENT_OUTPUT(j, num_outputs, output_data)
    Device cross-checks computed digest against sentinel and metadata.
 
-5. Orchard actions
+5. Orchard actions (HWP v4, 903 bytes each)
    For each action i in 0..N-1:
-     C → F: TX_OUTPUT(i, N, action_data[820])
-              (cv_net, nullifier, rk, cmx, ephemeral_key,
-               enc_ciphertext, out_ciphertext)
+     C → F: TX_OUTPUT(i, N, action_data[903])
+              (cv_net[32] || nullifier[32] || rk[32] || cmx[32] ||
+               ephemeral_key[32] || enc_ciphertext[580] ||
+               out_ciphertext[80] || recipient[43] || value[8 LE] ||
+               rseed[32])
+     Device recomputes cmx = Extract_P(NoteCommit(g_d, pk_d, v, ρ, ψ))
+     from the trailing note plaintext and constant-time-compares against
+     the cmx field; mismatch ⇒ SIGNER_ERR_NOTE_COMMITMENT_MISMATCH
+     (HWP error 0x0D) before any other action data is hashed.
+     The (recipient, value) pair is captured for the per-output review
+     loop with a confirmed=false flag.
      F → C: TX_OUTPUT_ACK(i)
 
-6. Shielded sighash sentinel
-   C → F: TX_OUTPUT(N, N, expected_sighash[32])
-   Device hashes actions incrementally (BLAKE2b-256 × 3) and compares
-   against the sentinel; on match → SIGNER_VERIFIED.
+6. Per-output user review (PAGE_SIGN_REVIEW_OUTPUT)
+   For each captured action i in 0..N-1:
+     Device encodes recipient via orchard_encode_ua_raw → Bech32m UA,
+     shows (UA, value) on screen, waits for OK (or Right) to confirm
+     or Back (or Left) to cancel.
+     OK   → orchard_signer_confirm_action(i)
+     Back → HWP_ERR_USER_CANCELLED (0x06), session aborts.
 
-7. User confirmation on screen
-   Device displays recipient + amount + fee, awaits OK / Cancel.
+7. Shielded sighash sentinel
+   C → F: TX_OUTPUT(N, N, expected_sighash[32])
+   Device verifies every action has confirmed=true (else
+   SIGNER_ERR_ACTION_NOT_CONFIRMED), recomputes the full ZIP-244 v5
+   sighash from header + transparent + sapling + orchard digests
+   (BLAKE2b-256 × 3 for orchard), constant-time-compares against the
+   sentinel; on match → SIGNER_VERIFIED; mismatch ⇒
+   SIGNER_ERR_SIGHASH_MISMATCH (HWP error 0x09).
 
 8. Orchard signing (per spend action)
-   C → F: SIGN_REQ(sighash, alpha, amount, fee, recipient)
+   C → F: SIGN_REQ(sighash, alpha, amount, fee, recipient_ua)
+   Device decodes recipient_ua and cross-checks it (constant-time)
+   against the confirmed-action recipients; mismatch ⇒
+   HWP_ERR_RECIPIENT_MISMATCH (0x0E).
    F → C: SIGN_RSP(sig || rk)
    The library refuses unless state = SIGNER_VERIFIED.
 
@@ -568,11 +637,46 @@ Evidence captured in `screenshots/mainnet_pair.png`,
   matched against the companion's value. The check is in the library,
   not in device-specific code; a hostile or buggy firmware port cannot
   bypass it.
+- **Library-enforced Sapling-component lockout** — `feed_meta()`
+  rejects any `TxMeta` whose `sapling_digest` differs from the ZIP-244
+  empty-bundle constant (`SIGNER_ERR_SAPLING_NOT_EMPTY`, HWP error
+  `0x0C`). Without this, a hostile companion could siphon value via a
+  Sapling output the device never sees in the Orchard stream. The
+  Flipper-Zcash wallet is Orchard-only by design, so the empty-bundle
+  invariant is a structural fit rather than an arbitrary restriction.
+- **Library-enforced per-action NoteCommitment recomputation** —
+  `feed_action_with_note()` recomputes
+  `cmx = Extract_P(NoteCommit(g_d, pk_d, value, ρ, ψ))` from the
+  unencrypted note plaintext (`recipient`, `value`, `rseed`) the
+  companion declares and rejects mismatches with
+  `SIGNER_ERR_NOTE_COMMITMENT_MISMATCH` (HWP error `0x0D`). Closes the
+  recipient-substitution attack a hostile companion would otherwise
+  mount inside the Orchard bundle (the cmx field of an encrypted
+  action is opaque to ZIP-244 hashing). An attacker would have to
+  break Sinsemilla.
+- **Library-enforced per-output user confirmation (no blind signing)**
+  — `verify()` refuses to advance to `SIGNER_VERIFIED` unless every
+  captured action has been explicitly confirmed via
+  `confirm_action(idx)`. The Flipper drives a dedicated review scene
+  (`PAGE_SIGN_REVIEW_OUTPUT`) for each output that displays the
+  Bech32m Unified Address and value, requiring an OK press to confirm
+  and Back/Cancel to abort. A firmware port that skipped the UI loop
+  would still be unable to extract a signature; the rejection is in
+  the C library, not in device-specific code.
+- **SIGN_REQ recipient cross-check** — the UA advertised by the
+  companion in `SIGN_REQ.recipient` is decoded on-device via
+  `orchard_decode_ua_orchard_receiver` and compared in constant time
+  against the recipients of the confirmed actions; a companion that
+  lies to its host UI is caught with `HWP_ERR_RECIPIENT_MISMATCH`
+  (`0x0E`).
 - **Library-enforced transparent-digest verification** — the same
   pattern applies to transparent ECDSA signing: the device recomputes
   the transparent digest from the streamed inputs/outputs and matches
   it against both the sentinel value and the digest in the transaction
-  metadata before any signature is emitted.
+  metadata before any signature is emitted. The per-input sighash
+  (ZIP-244 §S.2: amounts, scripts, txin_sig digests) is also computed
+  on-device for every `TRANSPARENT_SIGN_REQ`; no part of any signed
+  digest is taken on faith from the companion.
 - **Network-mismatch check** — the session coin type, the transaction
   metadata coin type, and the recipient address prefix (`u` / `utest`)
   are all required to agree before signing.
