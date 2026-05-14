@@ -107,3 +107,17 @@ size_t flipz_serial_drain(flipz_serial_byte_cb callback, void* ctx) {
     }
     return total;
 }
+
+size_t flipz_serial_drain_buf(uint8_t* out, size_t out_cap) {
+    /* Single non-blocking read of at most one CDC packet. The dispatcher
+     * loop calls this repeatedly and stops as soon as the parser has a
+     * complete frame; any unread bytes stay queued in the CDC RX FIFO
+     * (the USB stack's buffer) for the next call, which is what enables
+     * proper multi-frame back-pressure. */
+    s_listener_thread = furi_thread_get_current();
+    s_data_ready = false;
+    if(!out || out_cap == 0) return 0;
+    size_t cap = (out_cap > CDC_PKT_LEN) ? CDC_PKT_LEN : out_cap;
+    int32_t n = furi_hal_cdc_receive(SERIAL_CH, out, (uint16_t)cap);
+    return (n > 0) ? (size_t)n : 0;
+}

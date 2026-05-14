@@ -1,5 +1,6 @@
 #include "../flipz.h"
 #include "../helpers/flipz_file.h"
+#include "../helpers/flipz_secure.h"
 #include <string.h>
 
 void flipz_scene_menu_submenu_callback(void* context, uint32_t index) {
@@ -11,7 +12,17 @@ void flipz_scene_menu_submenu_callback(void* context, uint32_t index) {
 void flipz_scene_menu_on_enter(void* context) {
     FlipZ* app = context;
 
-    bool has_wallet = wallet_exists();
+    /* on_enter fires both on initial push AND when the menu is revealed
+     * from underneath a popped Pin/Settings/Scene_1. Reset the submenu so
+     * the second entry doesn't double-render every item on top of the
+     * stale ones from the first push. (Furi's scene manager calls
+     * on_exit only when the menu itself is popped, not when something
+     * lands on top of it, so on_exit's reset isn't enough.) */
+    submenu_reset(app->submenu);
+
+    /* "Has a wallet" = either the new sealed file or the legacy wallet.dat.
+     * The Generate/Import branch only fires when neither exists. */
+    bool has_wallet = flipz_secure_wallet_exists() || wallet_exists();
 
     const char* net_label = (app->testnet == FlipZTestnetOn) ? "TAZ" : "ZEC";
 
@@ -45,8 +56,31 @@ void flipz_scene_menu_on_enter(void* context) {
             app);
         submenu_add_item(
             app->submenu,
+            "Export FVK",
+            SubmenuIndexExportFVK,
+            flipz_scene_menu_submenu_callback,
+            app);
+        submenu_add_item(
+            app->submenu,
             "Regenerate wallet",
             SubmenuIndexScene1Renew,
+            flipz_scene_menu_submenu_callback,
+            app);
+        /* Change PIN is only meaningful for sealed wallets. Legacy
+         * wallet.dat is unencrypted; users on that path must wipe + create
+         * a new wallet to gain a PIN. */
+        if(flipz_secure_wallet_exists()) {
+            submenu_add_item(
+                app->submenu,
+                "Change PIN",
+                SubmenuIndexChangePin,
+                flipz_scene_menu_submenu_callback,
+                app);
+        }
+        submenu_add_item(
+            app->submenu,
+            "Wipe wallet",
+            SubmenuIndexWipe,
             flipz_scene_menu_submenu_callback,
             app);
     } else {
@@ -133,20 +167,38 @@ bool flipz_scene_menu_on_event(void* context, SceneManagerEvent event) {
             scene_manager_next_scene(app->scene_manager, FlipZSceneScene_1);
             return true;
         } else if(event.event == SubmenuIndexScene1New) {
+            /* New wallet → set a PIN first; the Pin scene will route back
+             * to scene_1 with overwrite=1 once provisioning completes. */
             app->overwrite_saved_seed = 1;
             app->import_from_mnemonic = 0;
-            app->wallet_create(app);
+            app->pin_mode = FlipZPinModeProvisionNew;
+            app->pin_post_action = FlipZPinPostGenerate;
+            scene_manager_set_scene_state(
+                app->scene_manager, FlipZSceneMenu, SubmenuIndexScene1New);
+            scene_manager_next_scene(app->scene_manager, FlipZScenePin);
             return true;
         } else if(event.event == SubmenuIndexScene1Renew) {
             app->overwrite_saved_seed = 1;
             app->import_from_mnemonic = 0;
             view_dispatcher_switch_to_view(app->view_dispatcher, FlipZViewRenewConfirm);
             return true;
+        } else if(event.event == SubmenuIndexWipe) {
+            view_dispatcher_switch_to_view(app->view_dispatcher, FlipZViewWipeConfirm);
+            return true;
         } else if(event.event == SubmenuIndexScene1Import) {
+            /* Import flow → collect PIN first (so the imported mnemonic is
+             * sealed). The Pin scene routes to scene_1 with import flag. */
             app->import_from_mnemonic = 1;
+            app->pin_mode = FlipZPinModeProvisionNew;
+            app->pin_post_action = FlipZPinPostImport;
             scene_manager_set_scene_state(
                 app->scene_manager, FlipZSceneMenu, SubmenuIndexScene1Import);
-            scene_manager_next_scene(app->scene_manager, FlipZSceneScene_1);
+            scene_manager_next_scene(app->scene_manager, FlipZScenePin);
+            return true;
+        } else if(event.event == SubmenuIndexChangePin) {
+            app->pin_mode = FlipZPinModeChangeOld;
+            app->pin_post_action = FlipZPinPostMenu;
+            scene_manager_next_scene(app->scene_manager, FlipZScenePin);
             return true;
         } else if(event.event == SubmenuIndexSettings) {
             scene_manager_set_scene_state(

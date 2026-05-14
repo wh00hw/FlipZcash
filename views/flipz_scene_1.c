@@ -15,6 +15,7 @@
 #include <bip39.h>
 #include <orchard.h>
 #include <pallas.h>
+#include <pbkdf2.h>
 #include <blake2b.h>
 #include <segwit_addr.h>
 #include <redpallas.h>
@@ -23,6 +24,7 @@
 #include <zip244.h>
 #include <bip32.h>
 #include <secp256k1.h>
+#include <hwp_dispatcher.h>
 // From: lib/qrcode
 #include <qrcodegen.h>
 #include <stdio.h>
@@ -73,6 +75,7 @@ typedef struct {
     char* recv_address;
     int addr_subpage; // 0=QR, 1=text
     char* fvk_hex;
+    int keys_page;    // 0=ask/ak, 1=nk, 2=rivk (used by PAGE_KEYS and PAGE_FVK)
 } FlipZScene1Model;
 
 // Signing display state
@@ -85,12 +88,31 @@ static const char* s_net_err_msg = "";
 static volatile bool s_sign_confirmed = false;
 static volatile bool s_sign_cancelled = false;
 static volatile bool s_sign_done = false;
+static volatile bool s_net_err_ack = false;   /* input handler sets this on any
+                                                 button press while the network
+                                                 mismatch screen is visible. */
 
 // Per-output review state (PAGE_SIGN_REVIEW_OUTPUT)
 static char s_review_ua[200];          /* full Bech32m UA for the output */
 static uint64_t s_review_value = 0;     /* zatoshis */
 static uint16_t s_review_index = 0;     /* 0-based */
 static uint16_t s_review_total = 0;
+/* Sub-page: 0 = address only (full UA on screen, no overlap with hint);
+ * 1 = value + Confirm/Cancel. The user flips between the two with the
+ * Right (next) and Left (back) buttons so they can read the entire UA
+ * without it being squeezed against the hint line. */
+static volatile uint8_t s_review_subpage = 0;
+
+/* Companion-link status surfaced to every signing-flow page so the user can
+ * always tell what the device is doing relative to the host (zipher-cli):
+ *  - phase (idle / connected / verifying / signing / ...)
+ *  - per-action progress N/M
+ * Driven by hwp_dispatcher via the phase_update callback; read from the
+ * draw functions. All access is plain assignment of word-sized values
+ * and reads-of-pointers, so no lock needed on Cortex-M. */
+static volatile HwpPhase s_link_phase = HWP_PHASE_IDLE;
+static volatile uint16_t s_link_act_idx = 0;   /* 1-based; 0 = N/A */
+static volatile uint16_t s_link_act_total = 0;
 
 // Mnemonic display
 #define DISP_LINE_COUNT 6
@@ -113,6 +135,16 @@ static void flipz_progress_cb(uint8_t pct, const char* label, void* ctx) {
     if(changed && s_progress_view) {
         with_view_model(s_progress_view, FlipZScene1Model * model, { UNUSED(model); }, true);
     }
+}
+
+/* Pallas/Sinsemilla yield trampoline. pallas_yield() invokes this every 5
+ * EC ops; we yield to the scheduler so the system thread-watchdog and
+ * other Furi threads (USB CDC, GUI) get to run. Without this the FAP
+ * monopolises the CPU for ~10–30 s during cmx recomputation, the watchdog
+ * kills the app, and the host sees a TransportError("Broken pipe"). */
+static void flipz_pallas_yield_cb(void* ctx) {
+    (void)ctx;
+    furi_thread_yield();
 }
 
 // Sinsemilla S-table lookup from SD card (64KB: 1024 points x 64 bytes each)
@@ -165,6 +197,7 @@ typedef struct {
     char passphrase[TEXT_BUFFER_SIZE];
     int view_mode;
     View* view;
+    FlipZ* app;          /* needed for sealed-wallet provisioning + cache */
 } GenWorkerCtx;
 
 static int32_t gen_worker_thread(void* ctx) {
@@ -184,26 +217,60 @@ static int32_t gen_worker_thread(void* ctx) {
     memzero(mnemonic, TEXT_BUFFER_SIZE);
 
     bool just_generated = false;
-    if(w->overwrite || !wallet_exists()) {
+    if(w->overwrite ||
+       (!flipz_secure_wallet_exists() && !wallet_exists())) {
         if(w->overwrite) {
-            wallet_delete();
-            flipz_file_delete(RECEIVE_FILE_MAINNET);
-            flipz_file_delete(RECEIVE_FILE_TESTNET);
+            /* Drop prior storage + cache (sealed file, legacy wallet.dat,
+             * UA cache). Keep pin_buf intact — we need it 4 lines later
+             * for flipz_secure_provision. The user-triggered Wipe entry
+             * uses flipz_full_wipe which also scrubs pin_buf. */
+            flipz_storage_reset_public(w->app);
         }
         int strength = w->strength;
         if(strength != 128 && strength != 192) strength = 256;
         const char* mnemonic_gen = mnemonic_generate(strength);
-        if(!mnemonic_gen || !wallet_save_mnemonic(mnemonic_gen)) {
-            if(mnemonic_gen) mnemonic_clear();
+        if(!mnemonic_gen) {
+            free(mnemonic);
+            goto fail_save;
+        }
+        /* Seal under PIN-derived AEAD (audit H-5). Provisioning resets
+         * the lockout counter and writes the sealed file atomically.
+         * Wire pbkdf2's progress hook to the same scene_1 progress label
+         * we already use for Sinsemilla, so the user sees the bar advance
+         * during the ~1 s PBKDF2 instead of holding "Loading wallet...". */
+        s_progress_pct = 0;
+        s_progress_label = "Sealing wallet (PIN)...";
+        s_progress_offset = 0;
+        s_progress_scale = 5;    /* Subsequent step (Deriving seed) jumps
+                                  * the bar to 5 %; reserve only the first
+                                  * 5 % so the bar never regresses. */
+        if(s_progress_view) {
+            with_view_model(s_progress_view, FlipZScene1Model * model,
+                            { UNUSED(model); }, true);
+        }
+        pbkdf2_set_progress_cb(flipz_progress_cb, NULL);
+        FlipzPinResult pr = flipz_secure_provision(
+            mnemonic_gen, w->app->pin_buf, w->passphrase);
+        pbkdf2_set_progress_cb(NULL, NULL);
+        s_progress_offset = 0;
+        s_progress_scale = 100;
+        if(pr != FLIPZ_PIN_OK) {
+            mnemonic_clear();
             free(mnemonic);
             goto fail_save;
         }
         strncpy(mnemonic, mnemonic_gen, TEXT_BUFFER_SIZE - 1);
         mnemonic_clear();
+        /* Mirror into the in-memory cache so the rest of this session can
+         * derive keys/addresses without going through the SD card again. */
+        memzero(w->app->cached_mnemonic, sizeof(w->app->cached_mnemonic));
+        strncpy(w->app->cached_mnemonic, mnemonic, TEXT_BUFFER_SIZE - 1);
+        w->app->is_unlocked = true;
+        memzero(w->app->pin_buf, FLIPZ_PIN_LEN);
         just_generated = true;
     }
 
-    if(!just_generated && !wallet_load_mnemonic(mnemonic)) {
+    if(!just_generated && !flipz_get_mnemonic(w->app, mnemonic, TEXT_BUFFER_SIZE)) {
         free(mnemonic);
         goto fail_load;
     }
@@ -394,605 +461,344 @@ done:
     return 0;
 }
 
-// Sign worker context
+// Sign worker context. Keys are NOT pre-derived on the GUI thread anymore —
+// the worker pulls the mnemonic from the unlocked cache, derives BIP-32
+// transparent + Orchard keys at startup with progress feedback, then enters
+// the serial loop. Pre-derivation on the GUI thread caused 1–10 s of UI
+// freeze depending on whether the keys cache hit.
 typedef struct {
-    uint8_t ask[32];
-    uint8_t ak[32];
-    uint8_t nk[32];
-    uint8_t rivk[32];
-    uint8_t t_sk[32];     // Transparent BIP-32 spending key (v3)
-    uint8_t t_pubkey[33]; // Transparent compressed pubkey (v3)
+    char passphrase[TEXT_BUFFER_SIZE];
+    uint32_t coin_type;   // 1 testnet, 133 mainnet (BIP-44 / ZIP-32 path)
     bool testnet;
     View* view;
+    FlipZ* app;
 } SignWorkerCtx;
 
-// Callback context for feeding serial bytes into HWP parser
-typedef struct {
-    HwpParser* parser;
-    HwpFeedResult last_result;
-} SerialParserCtx;
+/* ── HwpDispatcher callback adapters ──────────────────────────────────
+ * The protocol-driving loop (drain → parse → dispatch → reply, plus
+ * keepalive and IDLE detection) lives in libzcash-orchard-c's
+ * hwp_dispatcher.c. The functions below adapt Flipper-specific
+ * primitives (USB CDC, scene model updates, button wait loops) to the
+ * dispatcher's HwpDispatcher{Io,Ui} callback shape. */
 
-static void serial_parser_cb(uint8_t byte, void* ctx) {
-    SerialParserCtx* spc = (SerialParserCtx*)ctx;
-    if(spc->last_result == HWP_FEED_FRAME_READY || spc->last_result == HWP_FEED_CRC_ERROR) {
-        return;
-    }
-    HwpFeedResult r = hwp_parser_feed(spc->parser, byte);
-    if(r != HWP_FEED_INCOMPLETE) {
-        spc->last_result = r;
-    }
+static size_t flipz_disp_drain(uint8_t* out, size_t out_cap, void* ctx) {
+    UNUSED(ctx);
+    return flipz_serial_drain_buf(out, out_cap);
 }
 
-// Send an HWP frame over serial
-static void hwp_send(uint8_t seq, uint8_t msg_type, const uint8_t* payload, uint16_t len) {
-    uint8_t buf[HWP_MAX_FRAME];
-    size_t frame_len = hwp_encode(buf, seq, msg_type, payload, len);
-    flipz_serial_send_raw(buf, frame_len);
+static void flipz_disp_send(const uint8_t* data, size_t len, void* ctx) {
+    UNUSED(ctx);
+    flipz_serial_send_raw(data, len);
 }
 
-static void hwp_send_error(uint8_t seq, HwpErrorCode code, const char* msg) {
-    uint8_t buf[HWP_MAX_FRAME];
-    size_t frame_len = hwp_encode_error(buf, seq, code, msg);
-    flipz_serial_send_raw(buf, frame_len);
+static uint32_t flipz_disp_tick(void* ctx) {
+    UNUSED(ctx);
+    return furi_get_tick();
+}
+
+static void flipz_disp_sleep(uint32_t ms, void* ctx) {
+    UNUSED(ctx);
+    /* Cooperative sleep: wake on RX-event flag (set by the CDC rx
+     * callback in flipz_serial.c) or after the timeout, whichever
+     * comes first. Equivalent to the original worker loop's
+     * furi_thread_flags_wait. */
+    furi_thread_flags_wait(1, FuriFlagWaitAny, ms);
+}
+
+static bool flipz_disp_should_exit(void* ctx) {
+    UNUSED(ctx);
+    return s_sign_page == 0;
+}
+
+static HwpUiResult flipz_disp_review_output(
+    uint16_t idx_1_based, uint16_t total,
+    const char* addr_str, uint64_t value, void* ctx) {
+    SignWorkerCtx* w = (SignWorkerCtx*)ctx;
+    /* The dispatcher pre-encodes the destination (Orchard UA or
+     * transparent t-address) — copy into the display buffer the
+     * renderer reads. Truncate defensively; the buffer is sized for
+     * the longest UA the on-device library can produce. */
+    {
+        size_t cap = sizeof(s_review_ua) - 1;
+        size_t i = 0;
+        while(i < cap && addr_str[i] != '\0') {
+            s_review_ua[i] = addr_str[i];
+            i++;
+        }
+        s_review_ua[i] = '\0';
+    }
+    s_review_value = value;
+    s_review_index = (uint16_t)(idx_1_based - 1);
+    s_review_total = total;
+    s_review_subpage = 0;  /* start on the address page, user pages to value */
+    s_sign_confirmed = false;
+    s_sign_cancelled = false;
+    s_sign_page = PAGE_SIGN_REVIEW_OUTPUT;
+    with_view_model(w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
+
+    while(!s_sign_confirmed && !s_sign_cancelled && s_sign_page != 0) {
+        furi_delay_ms(100);
+    }
+    memzero(s_review_ua, sizeof(s_review_ua));
+    s_review_value = 0;
+
+    if(s_sign_page == 0) return HWP_UI_EXIT;
+    return s_sign_confirmed ? HWP_UI_OK : HWP_UI_CANCELLED;
+}
+
+static HwpUiResult flipz_disp_confirm_tx(
+    uint64_t amount, uint64_t fee, const char* recipient_str, void* ctx) {
+    SignWorkerCtx* w = (SignWorkerCtx*)ctx;
+    s_sign_amount = amount;
+    s_sign_fee = fee;
+    strncpy(s_sign_recipient, recipient_str, sizeof(s_sign_recipient) - 1);
+    s_sign_recipient[sizeof(s_sign_recipient) - 1] = '\0';
+    s_sign_confirmed = false;
+    s_sign_cancelled = false;
+    s_sign_done = false;
+    s_sign_page = PAGE_SIGN_ADDR;
+    with_view_model(w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
+
+    while(!s_sign_confirmed && !s_sign_cancelled && s_sign_page != 0) {
+        furi_delay_ms(100);
+    }
+    if(s_sign_page == 0) return HWP_UI_EXIT;
+    if(!s_sign_confirmed) {
+        s_sign_page = PAGE_SIGN_WAIT;
+        with_view_model(w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
+        return HWP_UI_CANCELLED;
+    }
+    return HWP_UI_OK;
+}
+
+static void flipz_disp_network_error(const char* msg, bool device_testnet,
+                                      void* ctx) {
+    SignWorkerCtx* w = (SignWorkerCtx*)ctx;
+    UNUSED(device_testnet);
+    s_net_err_msg = msg ? msg : "Network mismatch";
+    s_sign_page = PAGE_SIGN_NET_ERR;
+    s_net_err_ack = false;
+    with_view_model(w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
+    /* Dismiss on any keypress, 5-second hard cap so a head-less device
+     * still recovers automatically. */
+    for(int i = 0; i < 50 && s_sign_page != 0 && !s_net_err_ack; i++) {
+        furi_delay_ms(100);
+    }
+    if(s_sign_page == 0) return;
+    s_sign_page = PAGE_SIGN_WAIT;
+    with_view_model(w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
+}
+
+static void flipz_disp_phase(HwpPhase phase_, uint16_t idx, uint16_t total,
+                              void* ctx) {
+    SignWorkerCtx* w = (SignWorkerCtx*)ctx;
+    s_link_phase = phase_;
+    s_link_act_idx = idx;
+    s_link_act_total = total;
+    /* During heavy crypto (cmx recomputation, RedPallas signing) the
+     * standard PAGE_LOADING renderer with progress bar is what we want;
+     * everything else falls back to the PAGE_SERIAL renderer which uses
+     * s_sign_page to pick the appropriate per-state screen. */
+    bool busy = (phase_ == HWP_PHASE_VERIFY || phase_ == HWP_PHASE_SIGNING);
+    int desired_model_page = busy ? PAGE_LOADING : PAGE_SERIAL;
+
+    /* Map dispatcher phase → s_sign_page so the PAGE_SERIAL fall-through
+     * picks a coherent screen at every step:
+     *   SIGNING        → PAGE_SIGN_DONE (s_sign_done=false → "Signing...")
+     *   DONE           → PAGE_SIGN_DONE (s_sign_done=true  → "Signature sent!")
+     *   IDLE / CONN    → PAGE_SIGN_WAIT (ready-for-next-tx home screen)
+     * Phases that drive their own UI (REVIEW, AWAIT_CONFIRM via the
+     * review_action/confirm_tx callbacks) set s_sign_page themselves. */
+    int desired_sign_page = (int)s_sign_page;
+    switch(phase_) {
+    case HWP_PHASE_SIGNING:
+        desired_sign_page = PAGE_SIGN_DONE;
+        s_sign_done = false;
+        break;
+    case HWP_PHASE_DONE:
+        desired_sign_page = PAGE_SIGN_DONE;
+        s_sign_done = true;
+        break;
+    case HWP_PHASE_IDLE:
+    case HWP_PHASE_CONNECTED:
+        desired_sign_page = PAGE_SIGN_WAIT;
+        break;
+    default:
+        break;
+    }
+    s_sign_page = desired_sign_page;
+
+    with_view_model(
+        w->view, FlipZScene1Model * model,
+        { if(model->page != desired_model_page) model->page = desired_model_page; },
+        true);
+}
+
+static void flipz_disp_progress(uint8_t pct, const char* label, void* ctx) {
+    UNUSED(ctx);
+    s_progress_pct = pct;
+    s_progress_label = label;
 }
 
 // Worker thread: HWP v2 binary protocol for signing
 static int32_t sign_worker_thread(void* ctx) {
     SignWorkerCtx* w = (SignWorkerCtx*)ctx;
 
-    flipz_serial_init();
+    /* ===== Init phase: derive keys with progress feedback ============== */
+    /* Per-thread crypto state; scrubbed in the cleanup block at the end.
+     * Pre-derivation used to live on the GUI thread which froze the UI
+     * for ~1 s (mnemonic_to_seed) and 5–10 s (Sinsemilla derive_keys on
+     * cache miss). Doing it here lets the user see a real progress bar. */
+    CONFIDENTIAL uint8_t ask[32], ak[32], nk[32], rivk[32];
+    CONFIDENTIAL uint8_t t_sk[32];
+    uint8_t t_pubkey[33];
+    memzero(ask, 32); memzero(ak, 32); memzero(nk, 32); memzero(rivk, 32);
+    memzero(t_sk, 32); memzero(t_pubkey, 33);
 
-    HwpParser parser;
-    hwp_parser_init(&parser);
-    SerialParserCtx spc = {.parser = &parser, .last_result = HWP_FEED_INCOMPLETE};
+    pallas_set_progress_cb(flipz_progress_cb, NULL);
+    pbkdf2_set_progress_cb(flipz_progress_cb, NULL);
+    /* Wire a yield callback so multi-second Pallas/Sinsemilla loops do not
+     * starve the Flipper scheduler — without this, the FAP thread never
+     * relinquishes the CPU during cmx recomputation and the system thread-
+     * watchdog kills the app (manifests host-side as a USB CDC "Broken
+     * pipe"). pallas_yield() throttles to once-every-5-calls internally, so
+     * the cost is minimal. */
+    pallas_set_yield_cb(flipz_pallas_yield_cb, NULL);
+    sinsemilla_lookup_init();
+    s_progress_view = w->view;
+
+    /* Switch the UI to the loading screen for the duration of init. The
+     * sign-page renderer falls through to model->page when set, so this
+     * shows the standard progress bar from PAGE_LOADING. */
+    s_sign_page = PAGE_SIGN_INIT;
+    s_progress_offset = 0;
+    s_progress_scale = 5;
+    s_progress_pct = 0;
+    s_progress_label = "Loading mnemonic...";
+    with_view_model(
+        w->view,
+        FlipZScene1Model * model,
+        { model->page = PAGE_LOADING; },
+        true);
+
+    char mnemonic_buf[TEXT_BUFFER_SIZE];
+    memzero(mnemonic_buf, sizeof(mnemonic_buf));
+    if(!flipz_get_mnemonic(w->app, mnemonic_buf, sizeof(mnemonic_buf))) {
+        memzero(mnemonic_buf, sizeof(mnemonic_buf));
+        with_view_model(
+            w->view,
+            FlipZScene1Model * model,
+            {
+                model->mnemonic_only = true;
+                model->page = PAGE_MNEMONIC;
+                model->mnemonic = "ERROR:,No mnemonic available";
+            },
+            true);
+        goto sign_done;
+    }
+
+    s_progress_offset = 5;
+    s_progress_scale = 10;
+    s_progress_label = "Deriving seed...";
+    CONFIDENTIAL uint8_t seed[64];
+    mnemonic_to_seed(mnemonic_buf, w->passphrase, seed, 0);
+    memzero(mnemonic_buf, sizeof(mnemonic_buf));
+
+    s_progress_offset = 15;
+    s_progress_scale = 5;
+    s_progress_pct = 15;
+    s_progress_label = "BIP-32 transparent...";
+    if(bip32_derive_transparent_sk(seed, w->coin_type, t_sk, t_pubkey) != 0) {
+        memzero(t_sk, 32);
+        memzero(t_pubkey, 33);
+    }
+
+    s_progress_offset = 20;
+    s_progress_scale = 5;
+    s_progress_label = "Loading Orchard keys...";
+    bool keys_ok = wallet_load_keys(w->testnet, ask, ak, nk, rivk);
+    if(!keys_ok) {
+        /* Cache miss: derive Orchard ask/nk/rivk via Sinsemilla. The
+         * pallas progress cb dominates here, mapping its 0..100 onto
+         * the 25..100 % band. */
+        s_progress_offset = 25;
+        s_progress_scale = 75;
+        s_progress_label = "Deriving Orchard keys...";
+        CONFIDENTIAL uint8_t sk[32];
+        orchard_derive_account_sk(seed, w->coin_type, DERIV_ACCOUNT, sk);
+        orchard_derive_keys(sk, ask, nk, rivk);
+        memzero(sk, 32);
+        redpallas_derive_ak(ask, ak);
+        wallet_save_keys(w->testnet, ask, ak, nk, rivk);
+    }
+    memzero(seed, 64);
+    pbkdf2_set_progress_cb(NULL, NULL);
+
+    /* Init done — flip the UI back to "Serial listening...". */
+    s_progress_offset = 0;
+    s_progress_scale = 100;
+    s_sign_page = PAGE_SIGN_WAIT;
+    with_view_model(
+        w->view,
+        FlipZScene1Model * model,
+        { model->page = PAGE_SERIAL; },
+        true);
+
+    /* ===== Dispatcher invocation ====================================== */
+    flipz_serial_init();
 
     OrchardSignerCtx signer_ctx;
     orchard_signer_init(&signer_ctx);
 
-    uint8_t seq = 0;
-    bool connected = false;
-    bool user_confirmed = false;
+    /* Wire the FlipZ-specific I/O + UI primitives into the generic
+     * hwp_dispatcher (libzcash-orchard-c). All target-agnostic protocol
+     * logic — drain → parse → switch → reply, PING/PONG keepalive, IDLE
+     * detection, multi-frame drain handling, recipient validation — now
+     * lives in the library so every device target (FlipZcash, future
+     * ESP32 / BOLOS) gets the same battle-tested driver instead of each
+     * re-implementing it. */
+    HwpDispatcher d = {
+        .io = {
+            .serial_drain  = flipz_disp_drain,
+            .serial_send   = flipz_disp_send,
+            .get_tick_ms   = flipz_disp_tick,
+            .sleep_ms      = flipz_disp_sleep,
+            .should_exit   = flipz_disp_should_exit,
+        },
+        .ui = {
+            .review_output = flipz_disp_review_output,
+            .confirm_tx    = flipz_disp_confirm_tx,
+            .network_error = flipz_disp_network_error,
+            .phase_update  = flipz_disp_phase,
+            .progress      = flipz_disp_progress,
+        },
+        .keys = {
+            .ak       = ak,
+            .nk       = nk,
+            .rivk     = rivk,
+            .ask      = ask,
+            .t_sk     = t_sk,
+            .t_pubkey = t_pubkey,
+        },
+        .signer    = &signer_ctx,
+        .testnet   = w->testnet,
+        .user_ctx  = w,
+    };
 
-    // Send initial PING
-    hwp_send(seq++, HWP_MSG_PING, NULL, 0);
-
-    while(s_sign_page != 0) {
-        uint32_t flags = furi_thread_flags_wait(1, FuriFlagWaitAny, connected ? 50 : 500);
-        (void)flags;
-
-        if(s_sign_page == 0) break;
-
-        // Drain CDC and feed into parser
-        spc.last_result = HWP_FEED_INCOMPLETE;
-        size_t bytes_rx = flipz_serial_drain(serial_parser_cb, &spc);
-
-        // Collect full frame across multiple USB packets
-        if(bytes_rx > 0 && spc.last_result == HWP_FEED_INCOMPLETE) {
-            for(int retry = 0; retry < 5 && spc.last_result == HWP_FEED_INCOMPLETE; retry++) {
-                furi_delay_ms(5);
-                flipz_serial_drain(serial_parser_cb, &spc);
-            }
-        }
-
-        // Send PING only if idle
-        if(!connected && bytes_rx == 0) {
-            hwp_send(seq++, HWP_MSG_PING, NULL, 0);
-        }
-
-        if(spc.last_result == HWP_FEED_CRC_ERROR) {
-            hwp_send_error(0, HWP_ERR_BAD_FRAME, "CRC mismatch");
-            hwp_parser_init(&parser);
-            continue;
-        }
-        if(spc.last_result != HWP_FEED_FRAME_READY) continue;
-
-        // Frame received
-        HwpFrame* f = &parser.frame;
-        connected = true;
-
-        // Version check: accept v1 and v2
-        if(f->version != HWP_VERSION && f->version != 0x01) {
-            hwp_send_error(f->seq, HWP_ERR_UNSUPPORTED_VER, "Unsupported protocol version");
-            continue;
-        }
-
-        switch(f->type) {
-        case HWP_MSG_PONG:
-            break;
-
-        case HWP_MSG_PING:
-            hwp_send(f->seq, HWP_MSG_PONG, NULL, 0);
-            if(user_confirmed) {
-                // New session: reset signing and verification state
-                user_confirmed = false;
-                orchard_signer_reset(&signer_ctx);
-                s_sign_page = PAGE_SIGN_WAIT;
-                with_view_model(
-                    w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
-            }
-            break;
-
-        case HWP_MSG_FVK_REQ: {
-            // v2.1: parse coin_type from payload for network discrimination
-            if(f->payload_len >= HWP_FVK_REQ_SIZE) {
-                uint32_t req_coin = (uint32_t)f->payload[0] |
-                                    ((uint32_t)f->payload[1] << 8) |
-                                    ((uint32_t)f->payload[2] << 16) |
-                                    ((uint32_t)f->payload[3] << 24);
-                uint32_t device_coin = w->testnet ? 1u : 133u;
-                if(req_coin != 0 && req_coin != device_coin) {
-                    hwp_send_error(
-                        f->seq,
-                        HWP_ERR_NETWORK_MISMATCH,
-                        w->testnet ? "Device is on testnet"
-                                   : "Device is on mainnet");
-                    s_net_err_msg = w->testnet
-                        ? "Companion requested MAINNET"
-                        : "Companion requested TESTNET";
-                    s_sign_page = PAGE_SIGN_NET_ERR;
-                    with_view_model(
-                        w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
-                    for(int i = 0; i < 30 && s_sign_page != 0; i++) furi_delay_ms(100);
-                    if(s_sign_page == 0) break;
-                    s_sign_page = PAGE_SIGN_WAIT;
-                    with_view_model(
-                        w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
-                    break;
-                }
-                signer_ctx.coin_type = req_coin;
-            }
-            uint8_t payload[96];
-            memcpy(payload, w->ak, 32);
-            memcpy(payload + 32, w->nk, 32);
-            memcpy(payload + 64, w->rivk, 32);
-            hwp_send(f->seq, HWP_MSG_FVK_RSP, payload, 96);
-            break;
-        }
-
-        case HWP_MSG_TX_OUTPUT: {
-            // HWP v2: staged sighash verification via OrchardSignerCtx
-            HwpTxOutput txo;
-            if(!hwp_parse_tx_output(f->payload, f->payload_len, &txo)) {
-                hwp_send_error(f->seq, HWP_ERR_BAD_FRAME, "Invalid TX_OUTPUT payload");
-                break;
-            }
-
-            OrchardSignerError serr;
-            if(txo.output_index == HWP_TX_META_INDEX) {
-                // Transaction metadata (first message)
-                serr = orchard_signer_feed_meta(
-                    &signer_ctx, txo.output_data, txo.output_data_len, txo.total_outputs);
-                if(serr == SIGNER_ERR_NETWORK_MISMATCH) {
-                    hwp_send_error(f->seq, HWP_ERR_NETWORK_MISMATCH,
-                        "TxMeta coin_type != session coin_type");
-                    s_net_err_msg = "TX metadata network mismatch";
-                    s_sign_page = PAGE_SIGN_NET_ERR;
-                    with_view_model(
-                        w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
-                    for(int i = 0; i < 30 && s_sign_page != 0; i++) furi_delay_ms(100);
-                    if(s_sign_page == 0) break;
-                    s_sign_page = PAGE_SIGN_WAIT;
-                    with_view_model(
-                        w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
-                    orchard_signer_reset(&signer_ctx);
-                    break;
-                } else if(serr == SIGNER_ERR_SAPLING_NOT_EMPTY) {
-                    hwp_send_error(f->seq, HWP_ERR_SAPLING_NOT_EMPTY,
-                        "Sapling components not allowed (Orchard-only)");
-                    orchard_signer_reset(&signer_ctx);
-                    break;
-                } else if(serr == SIGNER_ERR_TOO_MANY_ACTIONS) {
-                    hwp_send_error(f->seq, HWP_ERR_BAD_FRAME,
-                        "Transaction has more outputs than the device can display");
-                    orchard_signer_reset(&signer_ctx);
-                    break;
-                } else if(serr != SIGNER_OK) {
-                    hwp_send_error(f->seq, HWP_ERR_BAD_FRAME, "Bad TX metadata");
-                    orchard_signer_reset(&signer_ctx);
-                    break;
-                }
-            } else if(txo.output_index == txo.total_outputs) {
-                // Sentinel: expected sighash for comparison
-                if(txo.output_data_len != 32) {
-                    hwp_send_error(f->seq, HWP_ERR_BAD_SIGHASH, "Bad sighash length");
-                    orchard_signer_reset(&signer_ctx);
-                    break;
-                }
-
-                /* Per-output review BEFORE the lib's verify() runs. The lib
-                 * refuses to advance to VERIFIED unless every captured
-                 * action has been confirmed via orchard_signer_confirm_action;
-                 * we drive the screen + button loop here so by the time we
-                 * call verify() the invariant is satisfied. */
-                bool all_confirmed = true;
-                const char* hrp = w->testnet ? "utest" : "u";
-                s_review_total = signer_ctx.actions_received;
-                for(uint16_t i = 0; i < signer_ctx.actions_received; i++) {
-                    uint8_t recipient[43];
-                    uint64_t value;
-                    OrchardSignerError gerr = orchard_signer_get_action_display(
-                        &signer_ctx, i, recipient, &value);
-                    if(gerr != SIGNER_OK) {
-                        all_confirmed = false;
-                        break;
-                    }
-                    int n = orchard_encode_ua_raw(
-                        recipient, recipient + 11, hrp,
-                        s_review_ua, sizeof(s_review_ua));
-                    if(n <= 0) {
-                        all_confirmed = false;
-                        break;
-                    }
-                    s_review_value = value;
-                    s_review_index = i;
-                    s_sign_confirmed = false;
-                    s_sign_cancelled = false;
-                    s_sign_page = PAGE_SIGN_REVIEW_OUTPUT;
-                    with_view_model(
-                        w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
-
-                    /* Block until OK / Cancel / scene-exit. */
-                    while(!s_sign_confirmed && !s_sign_cancelled && s_sign_page != 0) {
-                        furi_delay_ms(100);
-                    }
-                    if(s_sign_page == 0) {
-                        all_confirmed = false;
-                        break;
-                    }
-                    if(!s_sign_confirmed) {
-                        all_confirmed = false;
-                        break;
-                    }
-                    OrchardSignerError cerr = orchard_signer_confirm_action(&signer_ctx, i);
-                    if(cerr != SIGNER_OK) {
-                        all_confirmed = false;
-                        break;
-                    }
-                }
-                /* Wipe the staging buffer — recipient is not secret per se
-                 * but no reason to leave it lying in BSS once shown. */
-                memzero(s_review_ua, sizeof(s_review_ua));
-                s_review_value = 0;
-
-                if(!all_confirmed) {
-                    hwp_send_error(f->seq, HWP_ERR_USER_CANCELLED,
-                        "User cancelled per-output review");
-                    s_sign_page = PAGE_SIGN_WAIT;
-                    with_view_model(
-                        w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
-                    orchard_signer_reset(&signer_ctx);
-                    break;
-                }
-                /* Back to "verifying" indicator while we run the sighash check. */
-                s_sign_page = PAGE_SIGN_INIT;
-                with_view_model(
-                    w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
-
-                serr = orchard_signer_verify(&signer_ctx, txo.output_data);
-                if(serr == SIGNER_ERR_SIGHASH_MISMATCH) {
-                    hwp_send_error(f->seq, HWP_ERR_SIGHASH_MISMATCH,
-                        "Device sighash != companion sighash");
-                    orchard_signer_reset(&signer_ctx);
-                    break;
-                } else if(serr == SIGNER_ERR_ACTION_NOT_CONFIRMED) {
-                    /* Should be unreachable (loop above confirmed each), but
-                     * surface it cleanly if it ever fires. */
-                    hwp_send_error(f->seq, HWP_ERR_INVALID_STATE,
-                        "internal: action confirmation lost");
-                    orchard_signer_reset(&signer_ctx);
-                    break;
-                } else if(serr != SIGNER_OK) {
-                    hwp_send_error(f->seq, HWP_ERR_INVALID_STATE, "Verify failed");
-                    orchard_signer_reset(&signer_ctx);
-                    break;
-                }
-            } else {
-                /* Action data (index 0..N-1) — v4 payload: 820 action bytes
-                 * + 43 recipient + 8 value + 32 rseed. The note plaintext
-                 * lets the lib recompute cmx and reject recipient
-                 * substitution before any data is displayed to the user. */
-                HwpActionV4 av4;
-                if(!hwp_parse_action_v4(txo.output_data, txo.output_data_len, &av4)) {
-                    hwp_send_error(f->seq, HWP_ERR_BAD_FRAME,
-                        "Action payload must be 903 bytes (820 + 43 + 8 + 32)");
-                    orchard_signer_reset(&signer_ctx);
-                    break;
-                }
-                serr = orchard_signer_feed_action_with_note(
-                    &signer_ctx, av4.action, HWP_ACTION_DATA_SIZE,
-                    av4.recipient, av4.value, av4.rseed);
-                if(serr == SIGNER_ERR_NOTE_COMMITMENT_MISMATCH) {
-                    hwp_send_error(f->seq, HWP_ERR_NOTE_COMMITMENT_MISMATCH,
-                        "Action cmx does not commit to claimed recipient/value/rseed");
-                    orchard_signer_reset(&signer_ctx);
-                    break;
-                }
-                if(serr == SIGNER_ERR_TOO_MANY_ACTIONS) {
-                    hwp_send_error(f->seq, HWP_ERR_BAD_FRAME,
-                        "Transaction has more outputs than the device can display");
-                    orchard_signer_reset(&signer_ctx);
-                    break;
-                }
-                if(serr != SIGNER_OK) {
-                    hwp_send_error(f->seq, HWP_ERR_BAD_FRAME, "Bad action data");
-                    orchard_signer_reset(&signer_ctx);
-                    break;
-                }
-            }
-
-            hwp_send(f->seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
-            break;
-        }
-
-        case HWP_MSG_TX_TRANSPARENT_INPUT: {
-            // v3: transparent digest verification — wire-identical to TX_OUTPUT framing
-            if(f->payload_len < HWP_TX_OUTPUT_HEADER) {
-                hwp_send_error(f->seq, HWP_ERR_BAD_FRAME, "Transparent input too short");
-                break;
-            }
-            uint16_t input_index =
-                (uint16_t)f->payload[0] | ((uint16_t)f->payload[1] << 8);
-            uint16_t total_inputs =
-                (uint16_t)f->payload[2] | ((uint16_t)f->payload[3] << 8);
-            const uint8_t* t_data = f->payload + HWP_TX_OUTPUT_HEADER;
-            uint16_t t_data_len = f->payload_len - HWP_TX_OUTPUT_HEADER;
-
-            OrchardSignerError serr;
-
-            // First input (and we are still in RECEIVING_ACTIONS) → begin session
-            if(input_index == 0 && signer_ctx.state == SIGNER_RECEIVING_ACTIONS) {
-                serr = orchard_signer_begin_transparent(&signer_ctx, total_inputs, 0);
-                if(serr != SIGNER_OK) {
-                    hwp_send_error(f->seq, HWP_ERR_INVALID_STATE,
-                        "Cannot begin transparent");
-                    orchard_signer_reset(&signer_ctx);
-                    break;
-                }
-            }
-
-            // Sentinel: index == total → verify transparent digest
-            if(input_index == total_inputs) {
-                if(t_data_len != 32) {
-                    hwp_send_error(f->seq, HWP_ERR_BAD_FRAME,
-                        "Transparent sentinel must be 32 bytes");
-                    orchard_signer_reset(&signer_ctx);
-                    break;
-                }
-                serr = orchard_signer_verify_transparent(&signer_ctx, t_data);
-                if(serr == SIGNER_ERR_TRANSPARENT_MISMATCH) {
-                    hwp_send_error(f->seq, HWP_ERR_TRANSPARENT_DIGEST_MISMATCH,
-                        "Transparent digest mismatch");
-                    break;
-                } else if(serr != SIGNER_OK) {
-                    hwp_send_error(f->seq, HWP_ERR_INVALID_STATE,
-                        "Transparent verify failed");
-                    orchard_signer_reset(&signer_ctx);
-                    break;
-                }
-                hwp_send(f->seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
-                break;
-            }
-
-            // Normal input data
-            serr = orchard_signer_feed_transparent_input(
-                &signer_ctx, t_data, t_data_len);
-            if(serr != SIGNER_OK) {
-                HwpErrorCode code = (serr == SIGNER_ERR_BAD_STATE)
-                                        ? HWP_ERR_INVALID_STATE
-                                        : HWP_ERR_BAD_FRAME;
-                hwp_send_error(f->seq, code, "Bad transparent input");
-                orchard_signer_reset(&signer_ctx);
-                break;
-            }
-            hwp_send(f->seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
-            break;
-        }
-
-        case HWP_MSG_TX_TRANSPARENT_OUTPUT: {
-            // v3: transparent outputs for digest computation
-            if(f->payload_len < HWP_TX_OUTPUT_HEADER) {
-                hwp_send_error(f->seq, HWP_ERR_BAD_FRAME, "Transparent output too short");
-                break;
-            }
-            uint16_t output_index =
-                (uint16_t)f->payload[0] | ((uint16_t)f->payload[1] << 8);
-            uint16_t total_outputs =
-                (uint16_t)f->payload[2] | ((uint16_t)f->payload[3] << 8);
-            const uint8_t* t_data = f->payload + HWP_TX_OUTPUT_HEADER;
-            uint16_t t_data_len = f->payload_len - HWP_TX_OUTPUT_HEADER;
-
-            // Lazy: first output carries total_outputs — set it on the signer
-            if(output_index == 0 && signer_ctx.transparent_outputs_expected == 0) {
-                signer_ctx.transparent_outputs_expected = total_outputs;
-            }
-
-            OrchardSignerError serr = orchard_signer_feed_transparent_output(
-                &signer_ctx, t_data, t_data_len);
-            if(serr != SIGNER_OK) {
-                HwpErrorCode code = (serr == SIGNER_ERR_BAD_STATE)
-                                        ? HWP_ERR_INVALID_STATE
-                                        : HWP_ERR_BAD_FRAME;
-                hwp_send_error(f->seq, code, "Bad transparent output");
-                orchard_signer_reset(&signer_ctx);
-                break;
-            }
-            hwp_send(f->seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
-            break;
-        }
-
-        case HWP_MSG_TRANSPARENT_SIGN_REQ: {
-            // v3: on-device ECDSA signing for transparent inputs
-            if(f->payload_len < HWP_TX_OUTPUT_HEADER) {
-                hwp_send_error(f->seq, HWP_ERR_BAD_FRAME, "Transparent sign req too short");
-                break;
-            }
-            uint16_t input_index =
-                (uint16_t)f->payload[0] | ((uint16_t)f->payload[1] << 8);
-            const uint8_t* input_data = f->payload + HWP_TX_OUTPUT_HEADER;
-            uint16_t input_data_len = f->payload_len - HWP_TX_OUTPUT_HEADER;
-
-            if(!signer_ctx.transparent_verified) {
-                hwp_send_error(f->seq, HWP_ERR_INVALID_STATE,
-                    "Transparent not verified");
-                break;
-            }
-
-            // Compute per-input sighash on-device (ZIP-244 S.2)
-            uint8_t per_input_sighash[32];
-            zip244_transparent_per_input_sighash(
-                &signer_ctx.transparent_state,
-                input_index,
-                input_data,
-                input_data_len,
-                0x01, // SIGHASH_ALL
-                per_input_sighash);
-
-            // ECDSA sign with pre-derived transparent SK
-            uint8_t compact_sig[64];
-            if(secp256k1_ecdsa_sign_digest(w->t_sk, per_input_sighash, compact_sig) != 0) {
-                memzero(per_input_sighash, sizeof(per_input_sighash));
-                hwp_send_error(f->seq, HWP_ERR_SIGN_FAILED, "ECDSA sign failed");
-                break;
-            }
-
-            // DER-encode: der_sig_len[1] || der_sig[N] || sighash_type[1] || pubkey[33]
-            uint8_t der_sig[72];
-            size_t der_len = secp256k1_sig_to_der(compact_sig, der_sig);
-            memzero(compact_sig, sizeof(compact_sig));
-
-            uint8_t rsp[HWP_TRANSPARENT_SIGN_RSP_MAX];
-            rsp[0] = (uint8_t)der_len;
-            memcpy(rsp + 1, der_sig, der_len);
-            rsp[1 + der_len] = 0x01; // SIGHASH_ALL
-            memcpy(rsp + 1 + der_len + 1, w->t_pubkey, 33);
-
-            size_t rsp_len = 1 + der_len + 1 + 33;
-            hwp_send(f->seq, HWP_MSG_TRANSPARENT_SIGN_RSP, rsp, (uint16_t)rsp_len);
-            memzero(per_input_sighash, sizeof(per_input_sighash));
-            break;
-        }
-
-        case HWP_MSG_SIGN_REQ: {
-            HwpSignReq req;
-            if(!hwp_parse_sign_req(f->payload, f->payload_len, &req)) {
-                hwp_send_error(f->seq, HWP_ERR_BAD_SIGHASH, "Invalid SIGN_REQ payload");
-                break;
-            }
-
-            // Enforce ZIP-244 verification before signing
-            OrchardSignerError chk = orchard_signer_check(&signer_ctx, req.sighash);
-            if(chk == SIGNER_ERR_NOT_VERIFIED) {
-                hwp_send_error(f->seq, HWP_ERR_INVALID_STATE,
-                    "ZIP-244 verification not completed");
-                break;
-            } else if(chk == SIGNER_ERR_WRONG_SIGHASH) {
-                hwp_send_error(f->seq, HWP_ERR_SIGHASH_MISMATCH,
-                    "SIGN_REQ sighash != verified sighash");
-                break;
-            } else if(chk != SIGNER_OK) {
-                hwp_send_error(f->seq, HWP_ERR_INVALID_STATE, "Signer check failed");
-                break;
-            }
-
-            // Validate network (only on first request of a session)
-            if(!user_confirmed) {
-                bool addr_is_testnet = (strncmp(req.recipient, "utest", 5) == 0);
-                if(addr_is_testnet != w->testnet) {
-                    hwp_send_error(
-                        f->seq,
-                        HWP_ERR_NETWORK_MISMATCH,
-                        w->testnet ? "Mainnet addr on testnet signer"
-                                   : "Testnet addr on mainnet signer");
-                    s_net_err_msg = addr_is_testnet ? "Received TESTNET address"
-                                                    : "Received MAINNET address";
-                    s_sign_page = PAGE_SIGN_NET_ERR;
-                    with_view_model(
-                        w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
-                    for(int i = 0; i < 30 && s_sign_page != 0; i++) furi_delay_ms(100);
-                    if(s_sign_page == 0) break;
-                    s_sign_page = PAGE_SIGN_WAIT;
-                    with_view_model(
-                        w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
-                    break;
-                }
-
-                // Show confirmation UI
-                s_sign_amount = req.amount;
-                s_sign_fee = req.fee;
-                strncpy(s_sign_recipient, req.recipient, sizeof(s_sign_recipient) - 1);
-                s_sign_recipient[sizeof(s_sign_recipient) - 1] = '\0';
-                s_sign_confirmed = false;
-                s_sign_cancelled = false;
-                s_sign_done = false;
-                s_sign_page = PAGE_SIGN_ADDR;
-                with_view_model(
-                    w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
-
-                // Wait for user
-                while(!s_sign_confirmed && !s_sign_cancelled && s_sign_page != 0) {
-                    furi_delay_ms(100);
-                }
-                if(s_sign_page == 0) break;
-
-                if(!s_sign_confirmed) {
-                    hwp_send_error(f->seq, HWP_ERR_USER_CANCELLED, "User cancelled");
-                    s_sign_page = PAGE_SIGN_WAIT;
-                    with_view_model(
-                        w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
-                    break;
-                }
-
-                user_confirmed = true;
-            }
-
-            // Sign via OrchardSignerCtx (enforces verification invariant)
-            s_sign_page = PAGE_SIGN_DONE;
-            s_sign_done = false;
-            with_view_model(
-                w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
-
-            pallas_set_progress_cb(flipz_progress_cb, NULL);
-            uint8_t sig[64], rk[32];
-            OrchardSignerError serr = orchard_signer_sign(
-                &signer_ctx, req.sighash, w->ask, req.alpha, sig, rk);
-
-            if(serr != SIGNER_OK) {
-                hwp_send_error(f->seq, HWP_ERR_SIGN_FAILED, "RedPallas sign failed");
-                s_sign_page = PAGE_SIGN_WAIT;
-                with_view_model(
-                    w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
-                break;
-            }
-
-            // Send SIGN_RSP: sig[64] || rk[32] = 96 bytes
-            uint8_t rsp[96];
-            memcpy(rsp, sig, 64);
-            memcpy(rsp + 64, rk, 32);
-            hwp_send(f->seq, HWP_MSG_SIGN_RSP, rsp, 96);
-
-            s_sign_done = true;
-            with_view_model(
-                w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
-            break;
-        }
-
-        case HWP_MSG_ABORT:
-            // Companion requested session abort
-            s_sign_cancelled = true;
-            user_confirmed = false;
-            orchard_signer_reset(&signer_ctx);
-            s_sign_page = PAGE_SIGN_WAIT;
-            with_view_model(
-                w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
-            break;
-
-        default:
-            hwp_send_error(f->seq, HWP_ERR_UNKNOWN, "Unknown message type");
-            break;
-        }
-    }
+    hwp_dispatcher_run(&d);
 
     flipz_serial_deinit();
+
+sign_done:
+    /* Reached either via the normal serial-loop exit (s_sign_page == 0)
+     * or via the early-error labels above. Scrub all key material on
+     * stack before returning, deregister progress callbacks, drop the
+     * Sinsemilla LUT handle. */
+    pallas_set_progress_cb(NULL, NULL);
+    pbkdf2_set_progress_cb(NULL, NULL);
+    sinsemilla_lookup_deinit();
+    memzero(ask, 32); memzero(ak, 32); memzero(nk, 32); memzero(rivk, 32);
+    memzero(t_sk, 32); memzero(t_pubkey, 33);
     memzero(w, sizeof(SignWorkerCtx));
     free(w);
     return 0;
@@ -1041,6 +847,31 @@ static void flipz_scene_1_clear_text() {
     memzero(s_disp_lines, sizeof(s_disp_lines));
 }
 
+/* Persistent footer (y=54..63) for every signing-flow page: shows the
+ * companion-link status and per-action progress. A single static string
+ * table keeps rodata small (each label costs only sizeof(ptr) in .data).
+ * Caller is the GUI draw thread — read-only of volatile statics, no lock. */
+static const char* const LINK_LABELS[] = {
+    "idle", "conn", "meta", "verify", "review",
+    "tparent", "ok?", "sign", "done", "err"
+};
+static void draw_link_footer(Canvas* canvas) {
+    HwpPhase ph = s_link_phase;
+    const char* lbl =
+        ((unsigned)ph < sizeof(LINK_LABELS)/sizeof(LINK_LABELS[0]))
+            ? LINK_LABELS[ph] : "?";
+    char buf[24];
+    if(s_link_act_total > 0 && s_link_act_idx > 0) {
+        snprintf(buf, sizeof(buf), "%s  %u/%u",
+                 lbl, (unsigned)s_link_act_idx, (unsigned)s_link_act_total);
+    } else {
+        snprintf(buf, sizeof(buf), "%s", lbl);
+    }
+    canvas_draw_line(canvas, 0, 54, 127, 54);
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(canvas, 64, 56, AlignCenter, AlignTop, buf);
+}
+
 void flipz_scene_1_draw(Canvas* canvas, FlipZScene1Model* model) {
     canvas_clear(canvas);
     canvas_set_color(canvas, ColorBlack);
@@ -1048,7 +879,13 @@ void flipz_scene_1_draw(Canvas* canvas, FlipZScene1Model* model) {
 
     if(model->page == PAGE_LOADING) {
         canvas_set_font(canvas, FontPrimary);
-        canvas_draw_str(canvas, 2, 10, "Generate address");
+        /* Title reflects what the heavy crypto underneath is actually
+         * doing — "Generate address" during the receive-address flow,
+         * "Signing transaction" during a sign session (any non-zero
+         * s_sign_page means we're inside FlipZSceneScene_1's sign
+         * branch rather than gen-address). */
+        canvas_draw_str(canvas, 2, 10,
+            (s_sign_page != 0) ? "Signing transaction" : "Generate address");
         canvas_set_font(canvas, FontSecondary);
         canvas_draw_str(canvas, 2, 24, s_progress_label);
         canvas_draw_frame(canvas, 2, 34, 124, 10);
@@ -1131,13 +968,41 @@ void flipz_scene_1_draw(Canvas* canvas, FlipZScene1Model* model) {
         }
 
     } else if(model->page == PAGE_KEYS) {
+        /* Paginated: 1 key per page (3 lines of 22 hex chars). The full 64-char
+         * hex never fit on a 128-px screen; old layout silently truncated it. */
+        const char* labels[3] = {
+            "ask (SPEND KEY!)",
+            "nk (nullifier)",
+            "rivk (commit rand)"};
+        const char* hexes[3] = {
+            model->ask_hex ? model->ask_hex : "",
+            model->nk_hex ? model->nk_hex : "",
+            model->rivk_hex ? model->rivk_hex : ""};
+        int p = model->keys_page;
+        if(p < 0 || p > 2) p = 0;
+
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str_aligned(canvas, 64, 2, AlignCenter, AlignTop, labels[p]);
+
+        canvas_set_font(canvas, FontKeyboard);
+        const char* hex = hexes[p];
+        size_t hlen = strlen(hex);
+        const int cpl = 22;
+        char line[24];
+        for(int row = 0; row < 3; row++) {
+            size_t off = (size_t)(row * cpl);
+            if(off >= hlen) break;
+            size_t n = hlen - off;
+            if(n > (size_t)cpl) n = (size_t)cpl;
+            memcpy(line, hex + off, n);
+            line[n] = '\0';
+            canvas_draw_str_aligned(canvas, 64, 16 + row * 10, AlignCenter, AlignTop, line);
+        }
+
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str(canvas, 1, 8, "ask (spending key):");
-        canvas_draw_str(canvas, 1, 16, model->ask_hex ? model->ask_hex : "");
-        canvas_draw_str(canvas, 1, 28, "nk (nullifier key):");
-        canvas_draw_str(canvas, 1, 36, model->nk_hex ? model->nk_hex : "");
-        canvas_draw_str(canvas, 1, 48, "rivk (commit rand):");
-        canvas_draw_str(canvas, 1, 56, model->rivk_hex ? model->rivk_hex : "");
+        char foot[20];
+        snprintf(foot, sizeof(foot), "%d/3  [^v] navigate", p + 1);
+        canvas_draw_str_aligned(canvas, 64, 58, AlignCenter, AlignCenter, foot);
 
     } else if(model->page == PAGE_MNEMONIC) {
         flipz_scene_1_draw_mnemonic(model->mnemonic);
@@ -1148,27 +1013,39 @@ void flipz_scene_1_draw(Canvas* canvas, FlipZScene1Model* model) {
         }
 
     } else if(model->page == PAGE_FVK) {
-        canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(
-            canvas, 64, 6, AlignCenter, AlignCenter, "Full Viewing Key");
+        /* The FVK is stored as three concatenated 64-char hex strings:
+         * fvk_hex[0..63]   = ak
+         * fvk_hex[64..127] = nk
+         * fvk_hex[128..191]= rivk
+         * (no labels embedded — labels are drawn here so we can paginate). */
+        const char* labels[3] = {"FVK: ak", "FVK: nk", "FVK: rivk"};
+        int p = model->keys_page;
+        if(p < 0 || p > 2) p = 0;
+
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str_aligned(canvas, 64, 2, AlignCenter, AlignTop, labels[p]);
+
         if(model->fvk_hex) {
             canvas_set_font(canvas, FontKeyboard);
-            size_t len = strlen(model->fvk_hex);
-            const int cpl = 21;
-            int total_rows = ((int)len + cpl - 1) / cpl;
-            int block_h = total_rows * 8;
-            int y_start = 14 + (50 - block_h) / 2;
-            char line[22];
-            for(int row = 0; row < total_rows && row < 6; row++) {
+            const char* hex = model->fvk_hex + (size_t)p * 64;
+            const int cpl = 22;
+            char line[24];
+            for(int row = 0; row < 3; row++) {
                 size_t off = (size_t)(row * cpl);
-                size_t n = len - off;
+                if(off >= 64) break;
+                size_t n = 64 - off;
                 if(n > (size_t)cpl) n = (size_t)cpl;
-                memcpy(line, model->fvk_hex + off, n);
+                memcpy(line, hex + off, n);
                 line[n] = '\0';
                 canvas_draw_str_aligned(
-                    canvas, 64, y_start + row * 8, AlignCenter, AlignTop, line);
+                    canvas, 64, 16 + row * 10, AlignCenter, AlignTop, line);
             }
         }
+
+        canvas_set_font(canvas, FontSecondary);
+        char foot[20];
+        snprintf(foot, sizeof(foot), "%d/3  [^v] navigate", p + 1);
+        canvas_draw_str_aligned(canvas, 64, 58, AlignCenter, AlignCenter, foot);
 
     } else if(s_sign_page == PAGE_SIGN_INIT) {
         canvas_set_font(canvas, FontPrimary);
@@ -1181,42 +1058,47 @@ void flipz_scene_1_draw(Canvas* canvas, FlipZScene1Model* model) {
     } else if(s_sign_page == PAGE_SIGN_WAIT) {
         canvas_set_font(canvas, FontPrimary);
         canvas_draw_str_aligned(
-            canvas, 64, 16, AlignCenter, AlignCenter, "Serial listening...");
+            canvas, 64, 16, AlignCenter, AlignCenter, "Hardware Wallet");
         canvas_set_font(canvas, FontSecondary);
         canvas_draw_str_aligned(
-            canvas, 64, 34, AlignCenter, AlignCenter, "Awaiting commands from");
-        canvas_draw_str_aligned(
-            canvas, 64, 46, AlignCenter, AlignCenter, "companion broadcast app");
+            canvas, 64, 36, AlignCenter, AlignCenter, "Awaiting host...");
+        draw_link_footer(canvas);
 
     } else if(s_sign_page == PAGE_SIGN_REVIEW_OUTPUT) {
-        /* Per-output review screen: shows the recipient (UA) of the
-         * Orchard output the device just verified the cmx for, plus its
-         * value. The user must press OK to call orchard_signer_confirm_action
-         * — without confirmation the lib state machine refuses to advance
-         * to VERIFIED, and orchard_signer_sign() will then refuse with
-         * NOT_VERIFIED. Per-action enforcement, not a UI nicety. */
+        /* Per-output review: a single-screen view of one recipient.
+         * Layout sized for 64-px display:
+         *   y=1..10  header  "Output N/M" (FontPrimary)
+         *   y=12..46 UA wrap (5 lines × 7 px FontKeyboard = 35 px,
+         *            ≤ 110 chars; covers typical Orchard UAs without
+         *            truncation, t-addrs fit in 1-2 lines)
+         *   y=48..54 value   (FontSecondary)
+         *   y=56..63 hint    "[OK] Confirm   [<] Cancel"
+         *
+         * One screen, one OK to confirm. The original two-sub-page
+         * design was clearer in isolation but trapped the user in
+         * navigation confusion across 3+ outputs × 2 sub-pages × 2-3
+         * buttons; flattening to one screen halves the button budget.
+         * Per-action confirmation remains a security invariant: the
+         * library refuses to advance to VERIFIED unless every captured
+         * action has been confirmed. */
         canvas_set_font(canvas, FontPrimary);
         char hdr[24];
         snprintf(hdr, sizeof(hdr), "Output %u/%u",
                  (unsigned)(s_review_index + 1), (unsigned)s_review_total);
-        canvas_draw_str_aligned(canvas, 64, 2, AlignCenter, AlignTop, hdr);
+        canvas_draw_str_aligned(canvas, 64, 1, AlignCenter, AlignTop, hdr);
 
-        canvas_set_font(canvas, FontSecondary);
-        /* Wrap the UA into 25-char rows. Most Orchard-only UAs are ~106
-         * chars, so they fit in 5 lines. */
+        canvas_set_font(canvas, FontKeyboard);
         {
-            const int chars_per_line = 25;
-            const int y_start = 14;
-            const int line_h = 8;
-            const int max_lines = 4;   /* leave room for value + footer */
+            const int chars_per_line = 22;
+            const int y_start = 12;
+            const int line_h = 7;
+            const int max_lines = 5;
             size_t len = strlen(s_review_ua);
             for(int row = 0; row < max_lines && (size_t)(row * chars_per_line) < len; row++) {
-                char line[26];
+                char line[24];
                 size_t offset = row * chars_per_line;
                 size_t n = len - offset;
                 if(n > (size_t)chars_per_line) n = chars_per_line;
-                /* For the last visible row, replace the tail with "..."
-                 * if more chars remain. */
                 if(row == max_lines - 1 && (offset + n) < len) {
                     if(n > 3) n -= 3;
                     memcpy(line, s_review_ua + offset, n);
@@ -1230,6 +1112,7 @@ void flipz_scene_1_draw(Canvas* canvas, FlipZScene1Model* model) {
                     canvas, 64, y_start + row * line_h, AlignCenter, AlignTop, line);
             }
         }
+        canvas_set_font(canvas, FontSecondary);
         {
             char vbuf[32];
             snprintf(vbuf, sizeof(vbuf), "%lu.%08lu %s",
@@ -1239,32 +1122,43 @@ void flipz_scene_1_draw(Canvas* canvas, FlipZScene1Model* model) {
             canvas_draw_str_aligned(canvas, 64, 48, AlignCenter, AlignTop, vbuf);
         }
         canvas_draw_str_aligned(
-            canvas, 64, 58, AlignCenter, AlignCenter, "[>] Confirm  [<] Cancel");
+            canvas, 64, 57, AlignCenter, AlignTop,
+            "[OK] Confirm   [<] Cancel");
 
     } else if(s_sign_page == PAGE_SIGN_ADDR) {
+        /* Final-confirmation step 1 of 2: full UA across the screen.
+         * Right advances to PAGE_SIGN_AMOUNT (step 2) which shows the
+         * amount + fee and asks for the final OK. */
         canvas_set_font(canvas, FontPrimary);
         canvas_draw_str_aligned(
-            canvas, 64, 2, AlignCenter, AlignTop, "Recipient");
-        canvas_set_font(canvas, FontSecondary);
-        {
-            const int chars_per_line = 25;
-            const int y_start = 14;
-            const int line_h = 9;
-            const int max_lines = 5;
-            size_t len = strlen(s_sign_recipient);
-            for(int row = 0; row < max_lines && (size_t)(row * chars_per_line) < len; row++) {
-                char line[26];
-                size_t offset = row * chars_per_line;
-                size_t n = len - offset;
-                if(n > (size_t)chars_per_line) n = chars_per_line;
+            canvas, 64, 1, AlignCenter, AlignTop, "Recipient");
+        canvas_set_font(canvas, FontKeyboard);
+        const int chars_per_line = 22;
+        const int y_start = 13;
+        const int line_h = 7;
+        const int max_lines = 6;
+        size_t len = strlen(s_sign_recipient);
+        for(int row = 0; row < max_lines && (size_t)(row * chars_per_line) < len; row++) {
+            char line[24];
+            size_t offset = row * chars_per_line;
+            size_t n = len - offset;
+            if(n > (size_t)chars_per_line) n = chars_per_line;
+            if(row == max_lines - 1 && (offset + n) < len) {
+                if(n > 3) n -= 3;
+                memcpy(line, s_sign_recipient + offset, n);
+                memcpy(line + n, "...", 3);
+                line[n + 3] = '\0';
+            } else {
                 memcpy(line, s_sign_recipient + offset, n);
                 line[n] = '\0';
-                canvas_draw_str_aligned(
-                    canvas, 64, y_start + row * line_h, AlignCenter, AlignTop, line);
             }
+            canvas_draw_str_aligned(
+                canvas, 64, y_start + row * line_h, AlignCenter, AlignTop, line);
         }
+        canvas_set_font(canvas, FontSecondary);
         canvas_draw_str_aligned(
-            canvas, 64, 58, AlignCenter, AlignCenter, "[>] Continue  [<] Cancel");
+            canvas, 64, 57, AlignCenter, AlignTop,
+            "[>] Next   [<] Cancel");
 
     } else if(s_sign_page == PAGE_SIGN_AMOUNT) {
         canvas_set_font(canvas, FontPrimary);
@@ -1302,6 +1196,8 @@ void flipz_scene_1_draw(Canvas* canvas, FlipZScene1Model* model) {
         snprintf(expected, sizeof(expected), "Signer is on %s", s_coin_label);
         canvas_draw_str_aligned(
             canvas, 64, 44, AlignCenter, AlignCenter, expected);
+        canvas_draw_str_aligned(
+            canvas, 64, 58, AlignCenter, AlignCenter, "[OK] Dismiss");
 
     } else if(s_sign_page == PAGE_SIGN_DONE) {
         canvas_set_font(canvas, FontPrimary);
@@ -1315,6 +1211,7 @@ void flipz_scene_1_draw(Canvas* canvas, FlipZScene1Model* model) {
             canvas_draw_str_aligned(
                 canvas, 64, 40, AlignCenter, AlignCenter, s_progress_label);
         }
+        draw_link_footer(canvas);
     }
 }
 
@@ -1328,7 +1225,21 @@ bool flipz_scene_1_input(InputEvent* event, void* context) {
         FlipZScene1Model * model,
         { busy = (model->page == PAGE_LOADING); },
         false);
-    if(busy) return true;
+    /* PAGE_LOADING is shown during multi-second crypto (Sinsemilla cmx
+     * recompute, ZIP-244 sighash, RedPallas sign, PBKDF2). We ignore most
+     * keys so accidental presses don't fall through into half-rendered
+     * pages, but Back must still escape — otherwise a stuck device leaves
+     * the user with no way out short of pulling USB. The worker thread
+     * polls `s_sign_page == 0` between operations, so flipping that flag
+     * unblocks the per-output review and SIGN_REQ wait loops too. */
+    if(busy) {
+        if(event->type == InputTypeRelease && event->key == InputKeyBack) {
+            s_sign_page = 0;
+            s_sign_cancelled = true;
+            instance->callback(FlipZCustomEventScene1Back, instance->context);
+        }
+        return true;
+    }
 
     if(event->type == InputTypeRelease) {
         switch(event->key) {
@@ -1367,10 +1278,19 @@ bool flipz_scene_1_input(InputEvent* event, void* context) {
                 {
                     if(model->page == PAGE_ADDR_ZEC) {
                         model->addr_subpage = 1;
+                    } else if(s_sign_page == PAGE_SIGN_ADDR) {
+                        /* OK on the address page advances to the
+                         * amount confirmation page — same as Right.
+                         * Without this, OK does nothing here and the
+                         * user is likely to press Back/Left in
+                         * frustration, cancelling the whole flow. */
+                        s_sign_page = PAGE_SIGN_AMOUNT;
                     } else if(s_sign_page == PAGE_SIGN_AMOUNT) {
                         s_sign_confirmed = true;
                     } else if(s_sign_page == PAGE_SIGN_REVIEW_OUTPUT) {
                         s_sign_confirmed = true;
+                    } else if(s_sign_page == PAGE_SIGN_NET_ERR) {
+                        s_net_err_ack = true;
                     }
                 },
                 true);
@@ -1393,7 +1313,26 @@ bool flipz_scene_1_input(InputEvent* event, void* context) {
                 true);
             break;
         case InputKeyDown:
+            with_view_model(
+                instance->view,
+                FlipZScene1Model * model,
+                {
+                    if(model->page == PAGE_KEYS || model->page == PAGE_FVK) {
+                        model->keys_page = (model->keys_page + 1) % 3;
+                    }
+                },
+                true);
+            break;
         case InputKeyUp:
+            with_view_model(
+                instance->view,
+                FlipZScene1Model * model,
+                {
+                    if(model->page == PAGE_KEYS || model->page == PAGE_FVK) {
+                        model->keys_page = (model->keys_page + 2) % 3;
+                    }
+                },
+                true);
             break;
         case InputKeyMAX:
             break;
@@ -1418,34 +1357,46 @@ void flipz_scene_1_exit(void* context) {
         {
             model->page = PAGE_LOADING;
             memzero(model->seed, 64);
-            if(!model->mnemonic_only) {
+
+            /* `mnemonic_only` historically meant "we own the mnemonic
+             * pointer too" — but FVK / cached-UA paths set it true and
+             * still allocate recv_address / fvk_hex. So free everything
+             * we might own, NULL-check each pointer, and gate the
+             * mnemonic free on the bit. */
+            if(!model->mnemonic_only && model->mnemonic) {
                 memzero((void*)model->mnemonic, strlen(model->mnemonic));
                 free((void*)model->mnemonic);
-
-                if(model->ask_hex) {
-                    memzero((void*)model->ask_hex, 65);
-                    free((void*)model->ask_hex);
-                }
-                if(model->nk_hex) {
-                    memzero((void*)model->nk_hex, 65);
-                    free((void*)model->nk_hex);
-                }
-                if(model->rivk_hex) {
-                    memzero((void*)model->rivk_hex, 65);
-                    free((void*)model->rivk_hex);
-                }
-
-                if(model->recv_address) {
-                    memzero(model->recv_address, MAX_ADDR_BUF);
-                    free(model->recv_address);
-                }
-                if(model->fvk_hex) {
-                    memzero(model->fvk_hex, strlen(model->fvk_hex));
-                    free(model->fvk_hex);
-                    model->fvk_hex = NULL;
-                }
-                s_sign_page = 0;
             }
+            model->mnemonic = NULL;
+
+            if(model->ask_hex) {
+                memzero((void*)model->ask_hex, 65);
+                free((void*)model->ask_hex);
+                model->ask_hex = NULL;
+            }
+            if(model->nk_hex) {
+                memzero((void*)model->nk_hex, 65);
+                free((void*)model->nk_hex);
+                model->nk_hex = NULL;
+            }
+            if(model->rivk_hex) {
+                memzero((void*)model->rivk_hex, 65);
+                free((void*)model->rivk_hex);
+                model->rivk_hex = NULL;
+            }
+            if(model->recv_address) {
+                memzero(model->recv_address, MAX_ADDR_BUF);
+                free(model->recv_address);
+                model->recv_address = NULL;
+            }
+            if(model->fvk_hex) {
+                memzero(model->fvk_hex, strlen(model->fvk_hex));
+                free(model->fvk_hex);
+                model->fvk_hex = NULL;
+            }
+            model->keys_page = 0;
+            model->addr_subpage = 0;
+            s_sign_page = 0;
         },
         true);
 
@@ -1482,7 +1433,7 @@ void flipz_scene_1_enter(void* context) {
 
         if(!keys_ok) {
             char* mnemonic = malloc(TEXT_BUFFER_SIZE);
-            if(!mnemonic || !wallet_load_mnemonic(mnemonic)) {
+            if(!mnemonic || !flipz_get_mnemonic(app, mnemonic, TEXT_BUFFER_SIZE)) {
                 if(mnemonic) free(mnemonic);
                 with_view_model(
                     instance->view,
@@ -1512,20 +1463,29 @@ void flipz_scene_1_enter(void* context) {
         }
         memzero(ask, 32);
 
-        char* fvk = malloc(3 * 64 + 20);
+        /* In-memory: 3*64 hex chars concatenated (ak||nk||rivk), used by the
+         * paginated PAGE_FVK renderer. */
+        char* fvk = malloc(3 * 64 + 1);
         if(fvk) {
-            char* p = fvk;
-            p += sprintf(p, "ak:");
-            flipz_btox(ak, 32, p);
-            p += 64;
-            p += sprintf(p, "\nnk:");
-            flipz_btox(nk, 32, p);
-            p += 64;
-            p += sprintf(p, "\nrivk:");
-            flipz_btox(rivk, 32, p);
-        }
-        if(fvk) {
-            flipz_file_write("fvk.hex", fvk);
+            flipz_btox(ak, 32, fvk);
+            flipz_btox(nk, 32, fvk + 64);
+            flipz_btox(rivk, 32, fvk + 128);
+            fvk[192] = '\0';
+
+            /* On-disk: human-readable form with labels + newlines, kept
+             * compatible with the existing exporter format that companion
+             * tools / users expect. */
+            char fvk_disk[3 * 64 + 20];
+            char* dp = fvk_disk;
+            dp += sprintf(dp, "ak:");
+            memcpy(dp, fvk, 64);          dp += 64;
+            dp += sprintf(dp, "\nnk:");
+            memcpy(dp, fvk + 64, 64);     dp += 64;
+            dp += sprintf(dp, "\nrivk:");
+            memcpy(dp, fvk + 128, 64);    dp += 64;
+            *dp = '\0';
+            flipz_file_write("fvk.hex", fvk_disk);
+            memzero(fvk_disk, sizeof(fvk_disk));
         }
 
         memzero(ak, 32);
@@ -1545,31 +1505,28 @@ void flipz_scene_1_enter(void* context) {
         return;
     }
 
-    // Sign mode
+    // Sign mode — all derivation now happens inside the worker so the
+    // GUI thread doesn't freeze on the first-sign Sinsemilla key derive.
     if(view_mode == FlipZViewModeSign) {
         s_coin_label = (coin_type == CoinTypeZECOrchardTest) ? "TAZ" : "ZEC";
-        uint32_t derive_coin = (coin_type == CoinTypeZECOrchardTest) ? 1 : 133;
-        CONFIDENTIAL uint8_t ask[32], ak_key[32], nk_key[32], rivk_key[32];
-        CONFIDENTIAL uint8_t t_sk[32];
-        uint8_t t_pubkey[33];
-        memzero(t_sk, 32);
-        memzero(t_pubkey, 33);
+        s_sign_confirmed = false;
+        s_sign_cancelled = false;
+        s_sign_done     = false;
+        s_sign_page     = PAGE_SIGN_INIT;
+        s_progress_view = instance->view;
 
-        s_sign_page = PAGE_SIGN_INIT;
         with_view_model(
             instance->view,
             FlipZScene1Model * model,
             {
+                model->coin_type = coin_type;
                 model->mnemonic_only = true;
-                model->page = PAGE_SERIAL;
+                model->page = PAGE_LOADING;
             },
             true);
 
-        // Seed is required for transparent (BIP-32) derivation.
-        // Even when orchard keys are cached, we must load the mnemonic.
-        char* mnemonic = malloc(TEXT_BUFFER_SIZE);
-        if(!mnemonic) {
-            s_sign_page = 0;
+        SignWorkerCtx* sctx = malloc(sizeof(SignWorkerCtx));
+        if(!sctx) {
             with_view_model(
                 instance->view,
                 FlipZScene1Model * model,
@@ -1579,79 +1536,20 @@ void flipz_scene_1_enter(void* context) {
                     model->mnemonic = "ERROR:,Out of memory";
                 },
                 true);
-            return;
-        }
-        if(!wallet_load_mnemonic(mnemonic)) {
-            free(mnemonic);
             s_sign_page = 0;
-            with_view_model(
-                instance->view,
-                FlipZScene1Model * model,
-                {
-                    model->mnemonic_only = true;
-                    model->page = PAGE_MNEMONIC;
-                    model->mnemonic = "ERROR:,Load error";
-                },
-                true);
             return;
         }
-        CONFIDENTIAL uint8_t seed[64];
-        mnemonic_to_seed(mnemonic, passphrase_text, seed, 0);
-        memzero(mnemonic, TEXT_BUFFER_SIZE);
-        free(mnemonic);
+        memzero(sctx, sizeof(*sctx));
+        sctx->coin_type = (coin_type == CoinTypeZECOrchardTest) ? 1u : 133u;
+        sctx->testnet   = (coin_type == CoinTypeZECOrchardTest);
+        sctx->view      = instance->view;
+        sctx->app       = app;
+        strncpy(sctx->passphrase, passphrase_text, TEXT_BUFFER_SIZE - 1);
+        sctx->passphrase[TEXT_BUFFER_SIZE - 1] = '\0';
 
-        // Derive transparent spending key (BIP-32: m/44'/coin'/0'/0/0)
-        if(bip32_derive_transparent_sk(seed, derive_coin, t_sk, t_pubkey) != 0) {
-            memzero(t_sk, 32);
-            memzero(t_pubkey, 33);
-        }
-
-        bool keys_ok = wallet_load_keys(
-            coin_type == CoinTypeZECOrchardTest, ask, ak_key, nk_key, rivk_key);
-        if(!keys_ok) {
-            CONFIDENTIAL uint8_t sk[32];
-            orchard_derive_account_sk(seed, derive_coin, DERIV_ACCOUNT, sk);
-            orchard_derive_keys(sk, ask, nk_key, rivk_key);
-            memzero(sk, 32);
-            redpallas_derive_ak(ask, ak_key);
-            wallet_save_keys(
-                coin_type == CoinTypeZECOrchardTest, ask, ak_key, nk_key, rivk_key);
-        }
-        memzero(seed, 64);
-
-        s_sign_page = PAGE_SIGN_WAIT;
-        s_sign_confirmed = false;
-        s_sign_cancelled = false;
-        s_sign_done = false;
-        with_view_model(
-            instance->view,
-            FlipZScene1Model * model,
-            {
-                model->coin_type = coin_type;
-                model->mnemonic_only = true;
-                model->page = PAGE_SERIAL;
-            },
-            true);
-
-        SignWorkerCtx* sctx = malloc(sizeof(SignWorkerCtx));
-        if(sctx) {
-            memcpy(sctx->ask, ask, 32);
-            memcpy(sctx->ak, ak_key, 32);
-            memcpy(sctx->nk, nk_key, 32);
-            memcpy(sctx->rivk, rivk_key, 32);
-            memcpy(sctx->t_sk, t_sk, 32);
-            memcpy(sctx->t_pubkey, t_pubkey, 33);
-            sctx->testnet = (coin_type == CoinTypeZECOrchardTest);
-            sctx->view = instance->view;
-            instance->worker_thread = furi_thread_alloc_ex(
-                "ZcashSign", 8192, sign_worker_thread, sctx);
-            furi_thread_start(instance->worker_thread);
-        }
-        memzero(ask, 32);
-        memzero(nk_key, 32);
-        memzero(rivk_key, 32);
-        memzero(ak_key, 32);
-        memzero(t_sk, 32);
+        instance->worker_thread = furi_thread_alloc_ex(
+            "ZcashSign", 10240, sign_worker_thread, sctx);
+        furi_thread_start(instance->worker_thread);
         return;
     }
 
@@ -1698,11 +1596,21 @@ void flipz_scene_1_enter(void* context) {
         wctx->overwrite = overwrite;
         wctx->view_mode = view_mode;
         wctx->view = instance->view;
+        wctx->app = app;
         strncpy(wctx->passphrase, passphrase_text, TEXT_BUFFER_SIZE - 1);
         wctx->passphrase[TEXT_BUFFER_SIZE - 1] = '\0';
 
         instance->worker_thread =
-            furi_thread_alloc_ex("ZcashGen", 8192, gen_worker_thread, wctx);
+            /* 10 KB: enough for Sinsemilla (with the SD-backed LUT — the
+             * deep-recursion fallback path is not on this thread) plus
+             * the H-5 sealing primitives (PBKDF2-HMAC-SHA512 ctx ~360 B,
+             * AEAD pt_buf 240 + file_buf 310 + key 64 + tag 32 ≈ 1 KB).
+             * 16 KB was a debug over-allocation — the FAP heap on
+             * STM32WB55 is ~50 KB shared with the rest of view state, so
+             * a 16 KB thread stack starves the small mallocs that follow
+             * (mnemonic[256], addr[129], hex_buf[65]×3) and the user
+             * sees "Out of memory" from the worker's first malloc. */
+            furi_thread_alloc_ex("ZcashGen", 10240, gen_worker_thread, wctx);
         furi_thread_start(instance->worker_thread);
     }
 }

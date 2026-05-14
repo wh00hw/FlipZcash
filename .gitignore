@@ -1,2 +1,4 @@
 .claude/
 .vscode/tasks.json
+.venv/
+dist/

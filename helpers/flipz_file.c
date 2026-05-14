@@ -129,8 +129,12 @@ static bool wallet_raw_read(char* buf) {
     Storage* fs = furi_record_open(RECORD_STORAGE);
     File* f = storage_file_alloc(fs);
     bool ret = false;
+    /* Zero buf BEFORE the read. Callers (wallet_save_mnemonic etc.) malloc
+     * w without initialising it; on a partial-size migration the trailing
+     * bytes used to be uninitialised garbage and get persisted back to
+     * disk in the migration branch below. */
+    memzero(buf, W_FILE_SIZE);
     if(storage_file_open(f, WALLET_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
-        memzero(buf, W_FILE_SIZE);
         uint16_t bytes_read = storage_file_read(f, buf, W_FILE_SIZE);
         if(bytes_read == W_FILE_SIZE) {
             if(memcmp(buf, W_MAGIC, W_MAGIC_LEN) == 0) {
@@ -139,7 +143,8 @@ static bool wallet_raw_read(char* buf) {
         } else if(
             bytes_read >= (uint16_t)W_DAT_OFF + W_DAT_LEN &&
             memcmp(buf, W_MAGIC, W_MAGIC_LEN) == 0) {
-            // Migration from older/smaller wallet.dat
+            // Migration from older/smaller wallet.dat. buf is zero-initialised
+            // above, so trailing-byte garbage is no longer persisted.
             buf[W_NET_OFF] = '0'; // default mainnet
             storage_file_close(f);
             storage_file_free(f);
@@ -231,7 +236,7 @@ bool wallet_save_mnemonic(const char* mnemonic) {
     if(!wallet_raw_read_safe(w)) {
         memzero(w, W_FILE_SIZE);
         memcpy(w, W_MAGIC, W_MAGIC_LEN);
-        w[W_NET_OFF] = '1'; // default testnet
+        w[W_NET_OFF] = '1'; // default testnet (debug build / dev work)
     }
 
     uint8_t k1[64];
@@ -312,8 +317,14 @@ bool wallet_save_keys(
     char* w = malloc(W_FILE_SIZE);
     if(!w) return false;
     if(!wallet_raw_read_safe(w)) {
-        free(w);
-        return false;
+        /* Bootstrap a fresh wallet.dat skeleton if none exists yet, so a
+         * caller that derives keys before persisting a mnemonic does not
+         * silently fail. The empty K2/DAT sections (no "fb01" header) will
+         * cause wallet_load_mnemonic() to refuse — correct: nothing to
+         * load. mnemonic_save() called later will fill them in. */
+        memzero(w, W_FILE_SIZE);
+        memcpy(w, W_MAGIC, W_MAGIC_LEN);
+        w[W_NET_OFF] = testnet ? '1' : '0';
     }
 
     char* dest = w + (testnet ? W_KTEST_OFF : W_KMAIN_OFF);
@@ -391,8 +402,8 @@ bool wallet_save_testnet(bool testnet) {
 
 bool wallet_load_testnet(void) {
     char* w = malloc(W_FILE_SIZE);
-    if(!w) return true;
-    bool testnet = true;
+    if(!w) return true;        /* testnet default on OOM (debug build) */
+    bool testnet = true;        /* testnet default on no-wallet (debug) */
     if(wallet_raw_read_safe(w)) {
         testnet = (w[W_NET_OFF] != '0');
     }

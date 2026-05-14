@@ -7,6 +7,13 @@ App(
         "gui",
     ],
     stack_size=4 * 1024,
+    # 8 KB was needed when flipz_secure_unlock ran synchronously inside
+    # the Pin scene's GUI event handler (PBKDF2 + AEAD buffers + mnemonic
+    # staging blew through 4 KB). That work is now done on a dedicated
+    # 8 KB pin_unlock worker thread, so the GUI thread is back to its
+    # original light footprint and 4 KB suffices. Reverting also frees
+    # ~4 KB of FAP-load memory that was tipping the loader into
+    # "Not enough memory" on preload.
     order=10,
     fap_icon="flipz_10px.png",
     fap_private_libs=[
@@ -34,10 +41,14 @@ App(
                 "src/hwp.c",
                 "src/zip244.c",
                 "src/orchard_signer.c",
-                "src/aes/aescrypt.c",
-                "src/aes/aeskey.c",
-                "src/aes/aestab.c",
-                "src/aes/aes_modes.c",
+                "src/base58.c",
+                "src/hwp_dispatcher.c",
+                # Audit H-3: constant-time AES replaces the legacy Brian-
+                # Gladman files (aescrypt/aeskey/aestab/aes_modes — removed).
+                "src/aes/aes_ct.c",
+                # Audit H-5: PIN-derived sealing primitives.
+                "src/aead.c",
+                "src/wallet_lockout.c",
             ],
         ),
         Lib(
