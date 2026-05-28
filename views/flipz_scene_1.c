@@ -52,6 +52,7 @@
 #define PAGE_SIGN_NET_ERR 12
 #define PAGE_SIGN_DONE  8
 #define PAGE_SIGN_REVIEW_OUTPUT 13   /* per-output recipient+value review */
+#define PAGE_SIGN_REVIEW_MEMO   14   /* per-output memo plaintext review (ZIP-302) */
 
 struct FlipZScene1 {
     View* view;
@@ -102,6 +103,27 @@ static uint16_t s_review_total = 0;
  * Right (next) and Left (back) buttons so they can read the entire UA
  * without it being squeezed against the hint line. */
 static volatile uint8_t s_review_subpage = 0;
+
+/* Per-output memo review state (PAGE_SIGN_REVIEW_MEMO).
+ * The dispatcher hands us a 512-byte memo whose bytes are already
+ * cryptographically bound to enc_ciphertext on chain; this screen
+ * exists so the user can see the actual contents on the trusted
+ * display, not just the companion's UI claim.
+ *
+ * ZIP-302 framing of the memo (first byte):
+ *   0xF6                 -> empty memo (dispatcher skips the callback)
+ *   0x00..0xF4           -> UTF-8 text, padded with 0x00 to 512 bytes
+ *   0xF5 or 0xF7..0xFF   -> opaque / non-text (we render a short hex prefix)
+ *
+ * We page through the UTF-8 text 88 chars / page so the user can scan
+ * the whole memo. `s_review_memo_text_len` is the trimmed length
+ * (trailing 0x00 stripped); for opaque memos it's 0 and we render a
+ * banner + hex dump of the first 32 bytes. */
+static uint8_t s_review_memo[512];
+static uint16_t s_review_memo_text_len = 0;
+static uint8_t  s_review_memo_lead_byte = 0xF6; /* default = empty */
+static uint8_t  s_review_memo_page = 0;
+static uint8_t  s_review_memo_total_pages = 1;
 
 /* Companion-link status surfaced to every signing-flow page so the user can
  * always tell what the device is doing relative to the host (zipher-cli):
@@ -546,6 +568,66 @@ static HwpUiResult flipz_disp_review_output(
     return s_sign_confirmed ? HWP_UI_OK : HWP_UI_CANCELLED;
 }
 
+/* HWP v5 memo-review callback. Invoked by the dispatcher right after
+ * review_output for each Orchard action, when (and only when) the
+ * action was fed via the memo-verifying path AND the memo is not the
+ * ZIP-302 empty sentinel. The cryptographic binding from
+ * feed_action_with_note_and_memo() guarantees `memo` is byte-for-byte
+ * what ends up in the on-chain enc_ciphertext, so any divergence
+ * between the bytes the user sees here and what the companion's UI
+ * claimed is *the companion's lie* — not a wire-level issue. */
+static HwpUiResult flipz_disp_review_memo(
+    uint16_t idx_1_based, uint16_t total,
+    const char* recipient_addr_str,
+    const uint8_t memo[512],
+    void* ctx) {
+    SignWorkerCtx* w = (SignWorkerCtx*)ctx;
+    UNUSED(recipient_addr_str); /* the address was just shown in review_output */
+
+    s_review_index = (uint16_t)(idx_1_based - 1);
+    s_review_total = total;
+    memcpy(s_review_memo, memo, 512);
+    s_review_memo_lead_byte = memo[0];
+
+    /* ZIP-302 framing: text memos start with 0x00..0xF4 and are
+     * 0x00-padded to 512 bytes; trim the padding for display. Anything
+     * else is non-textual and we don't try to render it as text. */
+    if(s_review_memo_lead_byte <= 0xF4) {
+        size_t n = 512;
+        while(n > 0 && s_review_memo[n - 1] == 0x00) n--;
+        s_review_memo_text_len = (uint16_t)n;
+    } else {
+        s_review_memo_text_len = 0;
+    }
+
+    /* Pagination: 4 lines × 22 chars / page = 88 chars. Min 1 page so
+     * the "Press OK to confirm" hint always has somewhere to live. */
+    {
+        const uint16_t chars_per_page = 4 * 22;
+        uint16_t pages = (s_review_memo_text_len + chars_per_page - 1) / chars_per_page;
+        if(pages == 0) pages = 1;
+        if(pages > 255) pages = 255;
+        s_review_memo_total_pages = (uint8_t)pages;
+    }
+    s_review_memo_page = 0;
+    s_sign_confirmed = false;
+    s_sign_cancelled = false;
+    s_sign_page = PAGE_SIGN_REVIEW_MEMO;
+    with_view_model(w->view, FlipZScene1Model * model, { UNUSED(model); }, true);
+
+    while(!s_sign_confirmed && !s_sign_cancelled && s_sign_page != 0) {
+        furi_delay_ms(100);
+    }
+    /* Scrub the memo from RAM as soon as the user is done with the screen.
+     * memos can carry sensitive plaintext (invoice numbers, references). */
+    memzero(s_review_memo, sizeof(s_review_memo));
+    s_review_memo_text_len = 0;
+    s_review_memo_lead_byte = 0xF6;
+
+    if(s_sign_page == 0) return HWP_UI_EXIT;
+    return s_sign_confirmed ? HWP_UI_OK : HWP_UI_CANCELLED;
+}
+
 static HwpUiResult flipz_disp_confirm_tx(
     uint64_t amount, uint64_t fee, const char* recipient_str, void* ctx) {
     SignWorkerCtx* w = (SignWorkerCtx*)ctx;
@@ -767,6 +849,7 @@ static int32_t sign_worker_thread(void* ctx) {
         },
         .ui = {
             .review_output = flipz_disp_review_output,
+            .review_memo   = flipz_disp_review_memo,
             .confirm_tx    = flipz_disp_confirm_tx,
             .network_error = flipz_disp_network_error,
             .phase_update  = flipz_disp_phase,
@@ -1125,6 +1208,86 @@ void flipz_scene_1_draw(Canvas* canvas, FlipZScene1Model* model) {
             canvas, 64, 57, AlignCenter, AlignTop,
             "[OK] Confirm   [<] Cancel");
 
+    } else if(s_sign_page == PAGE_SIGN_REVIEW_MEMO) {
+        /* Memo review for the current Orchard output. Layout:
+         *   y=1..10   header  "Memo N/M (page p/P)"   (FontPrimary)
+         *   y=12..40  memo body                       (FontKeyboard, 4 lines × 7 px)
+         *   y=42..52  guidance for non-text memos     (when applicable)
+         *   y=56..63  hint    "[OK] Confirm  [<>] Page  [<<] Cancel"
+         *
+         * ZIP-302 lead-byte semantics drive what we render:
+         *  - 0x00..0xF4: UTF-8 text memo, paginated 88 chars / page.
+         *  - 0xF5      : "Arbitrary bytes — opaque memo" + first 32 B hex.
+         *  - 0xF7..0xFF: reserved by ZIP-302 — same as 0xF5.
+         */
+        canvas_set_font(canvas, FontPrimary);
+        {
+            char hdr[28];
+            snprintf(hdr, sizeof(hdr), "Memo %u/%u  %u/%u",
+                     (unsigned)(s_review_index + 1),
+                     (unsigned)s_review_total,
+                     (unsigned)(s_review_memo_page + 1),
+                     (unsigned)s_review_memo_total_pages);
+            canvas_draw_str_aligned(canvas, 64, 1, AlignCenter, AlignTop, hdr);
+        }
+
+        canvas_set_font(canvas, FontKeyboard);
+        if(s_review_memo_lead_byte <= 0xF4) {
+            /* UTF-8 text memo. */
+            const int chars_per_line = 22;
+            const int lines_per_page = 4;
+            const int chars_per_page = chars_per_line * lines_per_page;
+            const int y_start = 12;
+            const int line_h = 7;
+            size_t off = (size_t)s_review_memo_page * (size_t)chars_per_page;
+            for(int row = 0; row < lines_per_page; row++) {
+                if(off >= s_review_memo_text_len) break;
+                size_t n = s_review_memo_text_len - off;
+                if(n > (size_t)chars_per_line) n = chars_per_line;
+                char line[24];
+                memcpy(line, s_review_memo + off, n);
+                line[n] = '\0';
+                canvas_draw_str_aligned(
+                    canvas, 64, y_start + row * line_h,
+                    AlignCenter, AlignTop, line);
+                off += n;
+            }
+        } else {
+            /* Non-text memo (0xF5 or 0xF7..0xFF). The first byte is the
+             * marker; the next 32 bytes are rendered as hex so the
+             * user can at least cross-check the leading bytes against
+             * whatever the host claims is there. */
+            canvas_draw_str_aligned(canvas, 64, 12, AlignCenter, AlignTop,
+                                     "Non-text memo");
+            char hex[3 * 32 + 1];
+            int hex_off = 0;
+            int n = 32 < 511 ? 32 : 511;
+            for(int i = 0; i < n; i++) {
+                hex_off += snprintf(hex + hex_off, sizeof(hex) - hex_off,
+                                    "%02x ", s_review_memo[1 + i]);
+                if(hex_off >= (int)sizeof(hex) - 4) break;
+            }
+            /* Wrap the hex into two lines so the eye can scan it. */
+            char line[24];
+            int per = 21;
+            int total_len = hex_off;
+            for(int row = 0; row < 3 && row * per < total_len; row++) {
+                int take = total_len - row * per;
+                if(take > per) take = per;
+                memcpy(line, hex + row * per, take);
+                line[take] = '\0';
+                canvas_draw_str_aligned(canvas, 64, 22 + row * 7,
+                                         AlignCenter, AlignTop, line);
+            }
+        }
+
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str_aligned(
+            canvas, 64, 57, AlignCenter, AlignTop,
+            s_review_memo_total_pages > 1
+                ? "[OK]Confirm [<>]Page"
+                : "[OK]Confirm [<]Back");
+
     } else if(s_sign_page == PAGE_SIGN_ADDR) {
         /* Final-confirmation step 1 of 2: full UA across the screen.
          * Right advances to PAGE_SIGN_AMOUNT (step 2) which shows the
@@ -1267,6 +1430,14 @@ bool flipz_scene_1_input(InputEvent* event, void* context) {
                         s_sign_page = PAGE_SIGN_AMOUNT;
                     } else if(s_sign_page == PAGE_SIGN_REVIEW_OUTPUT) {
                         s_sign_confirmed = true;
+                    } else if(s_sign_page == PAGE_SIGN_REVIEW_MEMO) {
+                        /* Right = next memo page; clamp at last page so
+                         * the user has to press OK to confirm (no
+                         * accidental confirmation by paging past the
+                         * end). On single-page memos Right is a no-op. */
+                        if(s_review_memo_page + 1 < s_review_memo_total_pages) {
+                            s_review_memo_page++;
+                        }
                     }
                 },
                 true);
@@ -1289,6 +1460,11 @@ bool flipz_scene_1_input(InputEvent* event, void* context) {
                         s_sign_confirmed = true;
                     } else if(s_sign_page == PAGE_SIGN_REVIEW_OUTPUT) {
                         s_sign_confirmed = true;
+                    } else if(s_sign_page == PAGE_SIGN_REVIEW_MEMO) {
+                        /* OK = confirm the whole memo (regardless of
+                         * which page we're on — the user has had a
+                         * chance to page through). */
+                        s_sign_confirmed = true;
                     } else if(s_sign_page == PAGE_SIGN_NET_ERR) {
                         s_net_err_ack = true;
                     }
@@ -1308,6 +1484,15 @@ bool flipz_scene_1_input(InputEvent* event, void* context) {
                         s_sign_page = PAGE_SIGN_ADDR;
                     } else if(s_sign_page == PAGE_SIGN_REVIEW_OUTPUT) {
                         s_sign_cancelled = true;
+                    } else if(s_sign_page == PAGE_SIGN_REVIEW_MEMO) {
+                        /* Left = previous page; on page 0 it cancels the
+                         * whole signing flow (consistent with the Output
+                         * review screen above). */
+                        if(s_review_memo_page > 0) {
+                            s_review_memo_page--;
+                        } else {
+                            s_sign_cancelled = true;
+                        }
                     }
                 },
                 true);
