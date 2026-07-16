@@ -6,7 +6,7 @@
  * Replaces the legacy RC4 wallet.dat layout (now deprecated and explicitly
  * unsafe — RC4 has been broken since 2013 and the K1 was a hardcoded
  * obfuscation constant) with a sealed-blob format using AES-256-CTR +
- * HMAC-SHA256, both provided by libzcash-orchard-c (audit H-3 + H-5).
+ * HMAC-SHA256, both provided by libzcash-ironwood-c (audit H-3 + H-5).
  *
  * File layout: /ext/apps_data/flipz/wallet.sealed
  *
@@ -26,7 +26,7 @@
  * resists brute-force at the cryptographic layer (PBKDF2 cost makes
  * offline attacks expensive).
  *
- * Library dependency: aead.h, wallet_lockout.h from libzcash-orchard-c.
+ * Library dependency: aead.h, wallet_lockout.h from libzcash-ironwood-c.
  */
 
 #include <stdbool.h>

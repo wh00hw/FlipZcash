@@ -9,7 +9,7 @@
 #include "../helpers/flipz_string.h"
 #include "../helpers/flipz_file.h"
 #include "../helpers/flipz_serial.h"
-// From: lib/libzcash-orchard-c
+// From: lib/libzcash-ironwood-c
 #include <memzero.h>
 #include <rand.h>
 #include <bip39.h>
@@ -498,7 +498,7 @@ typedef struct {
 
 /* ── HwpDispatcher callback adapters ──────────────────────────────────
  * The protocol-driving loop (drain → parse → dispatch → reply, plus
- * keepalive and IDLE detection) lives in libzcash-orchard-c's
+ * keepalive and IDLE detection) lives in libzcash-ironwood-c's
  * hwp_dispatcher.c. The functions below adapt Flipper-specific
  * primitives (USB CDC, scene model updates, button wait loops) to the
  * dispatcher's HwpDispatcher{Io,Ui} callback shape. */
@@ -857,7 +857,7 @@ static int32_t sign_worker_thread(void* ctx) {
     orchard_signer_init(signer_ctx);
 
     /* Wire the FlipZ-specific I/O + UI primitives into the generic
-     * hwp_dispatcher (libzcash-orchard-c). All target-agnostic protocol
+     * hwp_dispatcher (libzcash-ironwood-c). All target-agnostic protocol
      * logic — drain → parse → switch → reply, PING/PONG keepalive, IDLE
      * detection, multi-frame drain handling, recipient validation — now
      * lives in the library so every device target (FlipZcash, future

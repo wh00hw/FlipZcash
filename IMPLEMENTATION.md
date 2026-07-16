@@ -10,7 +10,7 @@ companion [`README.md`](README.md) gives the user-facing overview.
 
 ## 1. Repository Layout
 
-### Cryptographic library — `lib/libzcash-orchard-c/` (git submodule)
+### Cryptographic library — `lib/libzcash-ironwood-c/` (git submodule)
 
 A standalone, MIT-licensed, zero-dependency C11 library
 ([github.com/wh00hw/libzcash-ironwood-c](https://github.com/wh00hw/libzcash-ironwood-c))
@@ -24,11 +24,16 @@ consumed unmodified by FlipZcash and by the ESP32-S2 reference port
 | `src/orchard.c` | ZIP-32 Orchard derivation, FF1-AES-256 diversifier, F4Jumble, ZIP-316 Unified Address encoding |
 | `src/redpallas.c` | RedPallas spend-authorization signing (RFC-6979-style nonce derived from BLAKE2b-512) |
 | `src/zip244.c` | Incremental ZIP-244 shielded sighash + transparent digest computation |
-| `src/orchard_signer.c` | Library-enforced state machine: signing refuses to run unless the sighash has been verified on-device |
+| `src/orchard_signer.c` | Library-enforced state machine: signing refuses to run unless sapling-empty + cmx + memo + per-output confirm + fee confirm + sighash all verified on-device |
 | `src/hwp.c` | Hardware Wallet Protocol parser/encoder (CRC-16/CCITT, frame state machine) |
+| `src/hwp_dispatcher.c` | Target-agnostic device-side protocol driver: drain → parse → dispatch → reply, keepalive, per-output/memo/fee review orchestration — consumed via ~7 callbacks |
 | `src/bip32.c`, `src/bip39.c`, `src/bip39_english.c` | HD-key derivation, BIP-39 mnemonic generation/validation |
 | `src/secp256k1.c` | secp256k1 ECDSA (RFC-6979 deterministic nonce, low-S normalized, DER) for transparent inputs |
-| `src/blake2b.c`, `src/sha2.c`, `src/hmac.c`, `src/pbkdf2.c`, `src/aes/*` | Vendored primitives (trezor-crypto / Gladman AES) |
+| `src/base58.c` | Base58Check — transparent `script_pubkey` → t-address rendering for the review screen |
+| `src/chacha20poly1305.c` | ChaCha20-Poly1305 (RFC 7539) — on-device `enc_ciphertext` recomputation (memo binding) |
+| `src/aead.c`, `src/wallet_lockout.c` | AES-256-CTR + HMAC-SHA256 AEAD, PIN KDF, PIN-failure lockout (sealed wallet storage) |
+| `src/aes/aes_ct.c` | Constant-time AES-256 (audit H-3; replaces the legacy T-table AES) |
+| `src/blake2b.c`, `src/sha2.c`, `src/hmac.c`, `src/pbkdf2.c`, `src/memzero.c`, `src/rand.c`, `src/hash_stubs.c` | Vendored/support primitives (trezor-crypto lineage) |
 | `src/segwit_addr.c` | Bech32m encoding (extended length limits for Unified Address) |
 
 ### FlipZcash application — repository root
@@ -38,18 +43,22 @@ library above with Flipper-specific UI, storage, USB, and RNG glue:
 
 | File | Role |
 |------|------|
-| `flipz.c`, `flipz.h` | App entry (`flipz_app`), allocation, scene/view dispatch, BIP-39 word-by-word import flow with autocomplete |
+| `flipz.c`, `flipz.h` | App entry (`flipz_app`), allocation, scene/view dispatch, BIP-39 word-by-word import flow with autocomplete, session mnemonic cache (`cached_mnemonic`, live only while unlocked) |
 | `flipz_coins.c`, `flipz_coins.h` | Coin enum (`CoinTypeZECOrchard = 133`, `CoinTypeZECOrchardTest = 1`) |
-| `application.fam` | App manifest declaring `libzcash-orchard-c` and `qrcode` as private libs |
-| `helpers/flipz_file.{c,h}` | `wallet.dat` storage (magic `FZ01`, RC4 K1/K2 layout, mainnet/testnet keys, backup) |
-| `helpers/flipz_string.{c,h}` | Hex conversion + `flipz_cipher` (RC4 wrapper) |
+| `application.fam` | App manifest declaring `libzcash-ironwood-c` and `qrcode` as private libs; RAM-tuning cdefines (`ORCHARD_SIGNER_MAX_ACTIONS=8`, `ORCHARD_SIGNER_MAX_MEMOS=4`, `HWP_MAX_PAYLOAD=1536`) |
+| `helpers/flipz_secure.{c,h}` | PIN-sealed wallet storage (`wallet.sealed`, magic `ZS01`): `wallet_pin_kdf` (PBKDF2, 50k iter) + `aead_aes256_ctr_hmac_seal`, lockout state file, wipe |
+| `helpers/flipz_file.{c,h}` | `wallet.dat` (magic `FZ01`): legacy RC4 K1/K2 mnemonic section (read-only migration path) + the **active** derived-key cache (`wallet_save_keys`/`wallet_load_keys`, cleartext hex — see §13) and address/FVK cache files |
+| `helpers/flipz_string.{c,h}` | Hex conversion + `flipz_cipher` (RC4 wrapper, legacy) |
 | `helpers/flipz_serial.{c,h}` | USB-CDC transport: `flipz_serial_init`, `_send_raw`, `_drain` |
 | `helpers/flipz_rng.c` | STM32WB55 hardware-RNG bridge into libzcash's `random_buffer` |
 | `helpers/flipz_custom_event.h` | Input event enum |
-| `scenes/flipz_scene_menu.c` | Main submenu (Address / USB Serial Signer / Keys / Mnemonic / Regenerate / Import / Settings) |
+| `scenes/flipz_scene_menu.c` | Main submenu (Address / USB Serial Signer / Keys / Mnemonic / Export FVK / Regenerate / Change PIN / Wipe / Import / Settings) |
+| `scenes/flipz_scene_pin.c` | PIN unlock / provision / change-PIN flows (async worker on a dedicated 8 KB thread) |
 | `scenes/flipz_scene_settings.c` | Network toggle, BIP-39 strength (128/192/256), passphrase toggle |
 | `scenes/flipz_scene_scene_1.c`, `flipz_scene.{c,h}`, `flipz_scene_config.h` | Scene routing |
-| `views/flipz_scene_1.c` | Workhorse: key/address derivation worker thread, HWP message dispatcher (sign worker), QR + address rendering, sighash UI |
+| `views/flipz_scene_1.c` | Workhorse: key/address derivation worker thread, HWP dispatcher glue (sign worker wiring `hwp_dispatcher_run()` + review/memo/confirm callbacks), QR + address rendering |
+| `views/flipz_pin_input.c` | PIN entry view |
+| `views/flipz_progress.c` | Progress-bar view (key derivation, PIN KDF) |
 
 The `lib/qrcode/` directory ships Project Nayuki's `qrcodegen` for on-screen
 QR rendering of the Unified Address.
@@ -128,13 +137,14 @@ CRC-16/CCITT (poly `0x1021`, init `0xFFFF`) over the entire header + payload.
 | `SIGN_REQ (0x05)` | C→F | `sighash[32] || alpha[32] || amount[8] || fee[8] || rlen[1] || recipient[N]` | Request RedPallas signature for an action |
 | `SIGN_RSP (0x06)` | F→C | `sig[64] || rk[32]` | RedPallas signature + randomized key |
 | `ERROR (0x07)` | either | `code[1] || message[N]` | Explicit error frame |
-| `TX_OUTPUT (0x08)` | C→F | `idx_le[2] || total_le[2] || data[N]` | Stream tx metadata (idx `0xFFFF`, 129 B) / v4 actions (idx 0..N-1, 903 B = 820 B ZIP-244 action + 43 B recipient + 8 B value + 32 B rseed) / sighash sentinel (idx N, 32 B) |
+| `TX_OUTPUT (0x08)` | C→F | `idx_le[2] || total_le[2] || data[N]` | Stream tx metadata (idx `0xFFFF`, 129 B v5 / 170 B v6) / actions (idx 0..N-1: 903 B cmx-only, 1415 B v5 memo-carrying, 1416/904 B v6 pool-tagged) / sighash sentinel (idx N, 32 B) |
 | `TX_OUTPUT_ACK (0x09)` | F→C | `idx_le[2]` | Per-frame acknowledgement |
 | `ABORT (0x0A)` | C→F | empty | Cancel session, reset state |
 | `TX_TRANSPARENT_INPUT (0x0B)` | C→F | `idx_le[2] || total_le[2] || data[N]` | Stream transparent inputs / digest sentinel |
 | `TX_TRANSPARENT_OUTPUT (0x0C)` | C→F | `idx_le[2] || total_le[2] || data[N]` | Stream transparent outputs |
 | `TRANSPARENT_SIGN_REQ (0x0D)` | C→F | `idx_le[2] || total_le[2] || data[N]` | Per-input ECDSA signing request |
 | `TRANSPARENT_SIGN_RSP (0x0E)` | F→C | `der_len[1] || der_sig[N] || sighash_type[1] || pubkey33[33]` | DER-encoded ECDSA signature + compressed pubkey |
+| `IDENTITY_REQ/RSP (0x0F/0x10)`, `ATTEST_REQ/RSP (0x11/0x12)` | C→F / F→C | pubkey / challenge / signature | Device attestation (protocol-defined, HWP v4 / audit M1). **Not implemented by FlipZcash** — no device-identity key is provisioned |
 
 ### Error codes
 
@@ -148,13 +158,24 @@ CRC-16/CCITT (poly `0x1021`, init `0xFFFF`) over the entire header + payload.
 | `0x0C` | Sapling-not-empty (`sapling_digest` ≠ ZIP-244 empty-bundle constant — Orchard-only invariant violation) |
 | `0x0D` | NoteCommitment mismatch (device-recomputed `cmx` ≠ `action.cmx` — recipient-substitution attempt) |
 | `0x0E` | Recipient mismatch (`SIGN_REQ.recipient` UA does not match any confirmed action) |
+| `0x0F` | Memo mismatch (device-recomputed `enc_ciphertext`/`epk` ≠ action fields — memo-substitution attempt) |
+| `0x10` | Bad `pk_d` (claimed note plaintext does not decode to a valid Pallas point) |
+| `0x11` | Fee not confirmed (`verify()` reached without user approval of the on-device-computed fee) |
+| `0x12` | Fee overflow (transparent value sums / `value_balance` combine out of range) |
+| `0x13` | Fee negative (`t_in + value_balance < t_out` — unbalanced bundle) |
 
 The version byte on the wire is `0x02`; the device accepts both `0x01`
-(legacy) and `0x02` inbound and always emits `0x02` outbound. HWP v3 added
-the transparent flow (`TX_TRANSPARENT_INPUT/OUTPUT`, `TRANSPARENT_SIGN_REQ/RSP`)
-and HWP v4 extended the Orchard `TX_OUTPUT` payload from 820 to 903 bytes
-to carry the unencrypted note plaintext required for on-device cmx
-recomputation.
+(legacy) and `0x02` inbound and always emits `0x02` outbound. The protocol
+levels beyond that are feature tiers discriminated by payload layout:
+v3 added the transparent flow (`TX_TRANSPARENT_INPUT/OUTPUT`,
+`TRANSPARENT_SIGN_REQ/RSP`); v4 extended the Orchard `TX_OUTPUT` payload
+from 820 to 903 bytes to carry the unencrypted note plaintext required for
+on-device cmx recomputation; v5 appended the 512-byte memo (1415 B) for
+on-device `enc_ciphertext` recomputation plus on-chip fee confirmation;
+v6 (NU6.3 / Ironwood) prepends a pool tag to each action (1416/904 B) and
+extends `TxMeta` to 170 bytes for the five-leaf sighash tree. FlipZcash
+consumes all tiers through the library dispatcher without firmware-side
+protocol code.
 
 ---
 
@@ -162,10 +183,10 @@ recomputation.
 
 The signing path is gated by a state machine implemented inside the
 cryptographic library (`OrchardSignerCtx` in
-`lib/libzcash-orchard-c/src/orchard_signer.c`). Any caller — FlipZcash,
+`lib/libzcash-ironwood-c/src/orchard_signer.c`). Any caller — FlipZcash,
 the ESP32-S2 reference port, or a future third-party wallet — gets all
-verification checks for free and cannot bypass them. Four checkpoints
-compose the "no blind signing" guarantee; all four must pass before
+verification checks for free and cannot bypass them. Six gates compose
+the "no blind signing" guarantee; all must pass before
 `orchard_signer_sign()` will produce a RedPallas signature.
 
 ```
@@ -176,40 +197,57 @@ compose the "no blind signing" guarantee; all four must pass before
                                         │  ① sapling_digest must equal
                                         │     ZIP-244 empty-bundle constant
                                         │     else SIGNER_ERR_SAPLING_NOT_EMPTY
+                                        │     (on v6 also: header constants +
+                                        │      sealed-Orchard flag policy,
+                                        │      else SIGNER_ERR_BAD_META)
                                         ▼
                            ┌────────────────────────┐
                            │   SIGNER_HAS_META      │
                            └────────────┬───────────┘
-                                        │ feed_action_with_note() × N
+                                        │ feed_action_with_note[_and_memo]() × N
                                         │  ② cmx = Extract_P(NoteCommit(
                                         │       g_d, pk_d, v, ρ, ψ))
                                         │     recomputed on-device from
                                         │     (recipient, value, rseed);
                                         │     mismatch ⇒
                                         │     SIGNER_ERR_NOTE_COMMITMENT_MISMATCH
-                                        │  (recipient, value) captured
+                                        │  ③ for memo-carrying payloads:
+                                        │     esk re-derived from rseed+ρ
+                                        │     (ZIP-212), enc_ciphertext + epk
+                                        │     recomputed via ChaCha20-Poly1305
+                                        │     and ct-compared; mismatch ⇒
+                                        │     SIGNER_ERR_MEMO_MISMATCH
+                                        │  (recipient, value, memo) captured
                                         │  with confirmed=false flag
                                         ▼
                            ┌────────────────────────┐
                            │  SIGNER_HAS_ACTIONS    │
                            └────────────┬───────────┘
-                                        │ confirm_action(i) × N
-                                        │  ③ firmware drives per-output
-                                        │     review UI, sets confirmed=true
-                                        │     once user OKs the displayed
-                                        │     (UA, value); missing confirm ⇒
+                                        │ confirm_action(i) × N, confirm_fee()
+                                        │  ④ dispatcher drives per-output
+                                        │     review UI (UA/t-addr + value,
+                                        │     then verified memo), sets
+                                        │     confirmed=true on user OK;
+                                        │     missing confirm ⇒
                                         │     SIGNER_ERR_ACTION_NOT_CONFIRMED
+                                        │  ⑤ fee = t_in − t_out + value_balance
+                                        │     computed on-chip (overflow +
+                                        │     negative checked), shown to the
+                                        │     user; missing confirm ⇒
+                                        │     SIGNER_ERR_FEE_NOT_CONFIRMED
                                         ▼
                            ┌────────────────────────┐
                            │  ACTIONS_CONFIRMED     │
                            └────────────┬───────────┘
                                         │ verify(expected_sighash)
-                                        │  ④ full ZIP-244 v5 sighash
-                                        │     recomputed on-device from
-                                        │     header + transparent + sapling
-                                        │     + orchard digests; constant-time
-                                        │     compared to companion's sighash;
-                                        │     mismatch ⇒
+                                        │  ⑥ full ZIP-244 sighash (four-leaf
+                                        │     v5, or five-leaf v6 with the
+                                        │     Ironwood pool digest) recomputed
+                                        │     on-device from header +
+                                        │     transparent + sapling + orchard
+                                        │     [+ ironwood] digests;
+                                        │     constant-time compared to
+                                        │     companion's sighash; mismatch ⇒
                                         │     SIGNER_ERR_SIGHASH_MISMATCH
                                         ▼
                            ┌────────────────────────┐
@@ -219,10 +257,11 @@ compose the "no blind signing" guarantee; all four must pass before
 
 `orchard_signer_sign()` rejects the call with `NOT_VERIFIED` unless the
 state has reached `SIGNER_VERIFIED`. A buggy or hostile firmware port
-cannot bypass any of the four checks because they live in the C library,
+cannot bypass any of the six gates because they live in the C library,
 not in device-specific code. The firmware is responsible only for
-driving the per-output review UI that satisfies invariant ③; it does
-not make signing-policy decisions.
+rendering the review screens that satisfy gates ④–⑤ (the iteration
+itself is driven by the library's HWP dispatcher); it does not make
+signing-policy decisions.
 
 `SIGN_REQ.recipient` cross-check (defense-in-depth): when the
 companion sends the final `SIGN_REQ`, the device decodes the advertised
@@ -244,6 +283,13 @@ faith from the companion.
 
 ## 6. Signing Flow (HWP)
 
+The device side of this flow is driven end-to-end by the library's
+target-agnostic dispatcher (`hwp_dispatcher_run()`): FlipZcash supplies
+I/O callbacks (CDC drain/send, ticks, sleep, exit) and UI callbacks
+(`review_output`, `review_memo`, `confirm_tx`, `network_error`,
+`phase_update`, `progress`) from `views/flipz_scene_1.c` and owns no
+protocol logic of its own.
+
 ```
 1. Handshake
    F → C: PING
@@ -255,10 +301,12 @@ faith from the companion.
             or HWP_ERR_NETWORK_MISMATCH if network differs
 
 3. Transaction metadata
-   C → F: TX_OUTPUT(idx=0xFFFF, total=N, metadata[129])
+   C → F: TX_OUTPUT(idx=0xFFFF, total=N, metadata[129 (v5) | 170 (v6)])
             (version, branch ID, lock time, expiry,
              orchard flags, value balance, anchor,
-             transparent + sapling digests, coin type)
+             transparent + sapling digests, coin type;
+             v6 adds ironwood flags/value balance/anchor —
+             tier discriminated by payload size)
    F → C: TX_OUTPUT_ACK(0xFFFF)
 
 4. Transparent digest verification (only for transparent spends)
@@ -270,35 +318,50 @@ faith from the companion.
      C → F: TX_TRANSPARENT_OUTPUT(j, num_outputs, output_data)
    Device cross-checks computed digest against sentinel and metadata.
 
-5. Orchard actions (HWP v4, 903 bytes each)
+5. Shielded actions
    For each action i in 0..N-1:
-     C → F: TX_OUTPUT(i, N, action_data[903])
-              (cv_net[32] || nullifier[32] || rk[32] || cmx[32] ||
-               ephemeral_key[32] || enc_ciphertext[580] ||
+     C → F: TX_OUTPUT(i, N, action_data)
+              base (903 B): cv_net[32] || nullifier[32] || rk[32] ||
+               cmx[32] || ephemeral_key[32] || enc_ciphertext[580] ||
                out_ciphertext[80] || recipient[43] || value[8 LE] ||
-               rseed[32])
+               rseed[32]
+              v5 memo-carrying: base || memo[512]        (1415 B)
+              v6 pool-tagged:   pool[1] || base [|| memo] (904/1416 B,
+               pool 0x00 = sealed Orchard, 0x01 = Ironwood)
      Device recomputes cmx = Extract_P(NoteCommit(g_d, pk_d, v, ρ, ψ))
      from the trailing note plaintext and constant-time-compares against
      the cmx field; mismatch ⇒ SIGNER_ERR_NOTE_COMMITMENT_MISMATCH
      (HWP error 0x0D) before any other action data is hashed.
-     The (recipient, value) pair is captured for the per-output review
-     loop with a confirmed=false flag.
+     For memo-carrying payloads it additionally re-derives esk from
+     rseed+ρ (ZIP-212), recomputes enc_ciphertext + epk via
+     ChaCha20-Poly1305, and ct-compares; mismatch ⇒
+     SIGNER_ERR_MEMO_MISMATCH (HWP error 0x0F).
+     The (recipient, value, memo) info is captured for the per-output
+     review loop with a confirmed=false flag.
      F → C: TX_OUTPUT_ACK(i)
 
-6. Per-output user review (PAGE_SIGN_REVIEW_OUTPUT)
-   For each captured action i in 0..N-1:
-     Device encodes recipient via orchard_encode_ua_raw → Bech32m UA,
-     shows (UA, value) on screen, waits for OK (or Right) to confirm
-     or Back (or Left) to cancel.
+6. Per-output user review (dispatcher-driven)
+   The dispatcher iterates the captured outputs — transparent outputs
+   first (rendered as base58check t-addresses via script_to_taddr),
+   then shielded recipients (encoded via orchard_encode_ua_raw →
+   Bech32m UA) — and calls the firmware's review callbacks:
+     review_output → PAGE_SIGN_REVIEW_OUTPUT shows (address, value);
+       OK (or Right) confirms, Back (or Left) cancels.
+     review_memo   → PAGE_SIGN_REVIEW_MEMO shows the device-verified
+       memo (paginated; skipped for empty ZIP-302 memos).
      OK   → orchard_signer_confirm_action(i)
      Back → HWP_ERR_USER_CANCELLED (0x06), session aborts.
+   The on-chip-computed miner fee is then presented for approval
+   (review_output fallback with "Network fee") →
+   orchard_signer_confirm_fee().
 
 7. Shielded sighash sentinel
    C → F: TX_OUTPUT(N, N, expected_sighash[32])
    Device verifies every action has confirmed=true (else
-   SIGNER_ERR_ACTION_NOT_CONFIRMED), recomputes the full ZIP-244 v5
-   sighash from header + transparent + sapling + orchard digests
-   (BLAKE2b-256 × 3 for orchard), constant-time-compares against the
+   SIGNER_ERR_ACTION_NOT_CONFIRMED) and the fee was approved (else
+   SIGNER_ERR_FEE_NOT_CONFIRMED), recomputes the full ZIP-244 sighash
+   from header + transparent + sapling + orchard [+ ironwood] digests
+   (BLAKE2b-256 × 3 per pool), constant-time-compares against the
    sentinel; on match → SIGNER_VERIFIED; mismatch ⇒
    SIGNER_ERR_SIGHASH_MISMATCH (HWP error 0x09).
 
@@ -358,7 +421,17 @@ Transparent inputs follow the standard Zcash BIP-44 path
 `m / 44' / coin_type' / 0' / 0 / 0` (133 mainnet, 1 testnet). The
 transparent spending key and compressed pubkey are derived once per
 signing session and cached in RAM alongside the Orchard keys; the
-BIP-39 seed is zeroed immediately after derivation and never persisted.
+BIP-39 seed is zeroed immediately after derivation.
+
+RAM/persistence contract: the mnemonic is persisted PIN-sealed
+(`wallet.sealed`, AEAD) and, while the wallet is unlocked, cached in RAM
+(`cached_mnemonic`) for the session so key derivation and mnemonic display
+don't require re-entering the PIN. To skip the multi-minute Sinsemilla
+re-derivation, the derived Orchard keys — `ask`, `ak`, `nk`, `rivk` — are
+also cached on SD in `wallet.dat` (hex, **not encrypted**;
+`wallet_save_keys()` / `wallet_load_keys()`), and the FVK/UA in `fvk.hex` /
+address cache files. Note that this derived-key cache includes the spending
+key in cleartext — see the acknowledged limitations in §13.
 
 ---
 
@@ -382,7 +455,7 @@ for `i ∈ 0..1024`.
 
 The library exposes a pluggable lookup callback,
 `pallas_set_sinsemilla_lookup(fn, ctx)` in
-`lib/libzcash-orchard-c/src/pallas.c`. FlipZcash registers a callback
+`lib/libzcash-ironwood-c/src/pallas.c`. FlipZcash registers a callback
 that seeks into the SD-card file and returns the 64-byte record for the
 requested index:
 
@@ -399,7 +472,7 @@ Each LUT entry is independently reproducible: any caller can recompute
 `hash_to_curve("z.cash:SinsemillaS", i)` and check the bytes match. No
 attestation or signature on the LUT is required; correctness is
 established by the 49 known-answer vectors in
-`lib/libzcash-orchard-c/tests/test_vectors.c`.
+`lib/libzcash-ironwood-c/tests/test_vectors.c`.
 
 The ESP32-S2 reference port (`zcash-hw-wallet-esp32`) embeds the same
 LUT into firmware via `EMBED_FILES`; FlipZcash chose SD-card loading to
@@ -410,7 +483,10 @@ keep the FAP small.
 ## 9. Cryptographic Primitives — Implementation Notes
 
 The Orchard primitives are implemented from scratch in plain C against
-the Zcash Protocol Specification v2024.5.1 (NU6.1).
+the Zcash Protocol Specification (originally v2024.5.1 / NU6.1, since
+extended to NU6.3 / Ironwood: ZIP 258 pool digests and ZIP 2005 V3 note
+plaintexts, cross-validated against `orchard` 0.15 in the library's
+`tests/test_ironwood.c`).
 
 ### Pallas field arithmetic
 
@@ -528,7 +604,9 @@ into the PCZT.
 
 ### 4 KiB stack budget
 
-The application stack is 4 KiB (8 KiB for the worker thread).
+The application (GUI) stack is 4 KiB; dedicated worker threads carry the
+heavy lifting (8 KiB for the PIN-unlock worker, 10 KiB for the signing
+worker that runs the HWP dispatcher).
 
 - **`static` locals in hot functions.** `fp_mul`, `fp_inv`, `fp_sqrt`
   and the point routines use file-scope `static` locals to keep
@@ -588,7 +666,7 @@ All measurements on Flipper Zero (STM32WB55 @ 64 MHz):
 | secp256k1 ECDSA (transparent) | ~1 s | 1 scalar mul + RFC-6979 nonce |
 | **First UA generation, no LUT** | **~15-18 min** | one-time |
 | **First UA generation, with LUT** | **~1.5 min** | one-time |
-| **Subsequent launches** | **instant** | UA loaded from `wallet.dat` |
+| **Subsequent launches** | **instant** | UA + derived keys loaded from the on-SD cache (`wallet.dat` keys section, `fvk.hex`, address cache) |
 | **End-to-end mainnet broadcast** | **~20 s** | excluding companion's Halo2 proof (~2 min on desktop) |
 
 ---
@@ -601,7 +679,7 @@ All measurements on Flipper Zero (STM32WB55 @ 64 MHz):
 | BIP-39 | ✅ Complete | 12/18/24 words, optional passphrase |
 | BIP-44 | ✅ Complete | Coin types 133 (mainnet), 1 (testnet) |
 | ZIP-32 (Orchard) | ✅ Complete | Hierarchical hardened derivation |
-| ZIP-244 | ✅ Complete | Shielded txid digest + transparent per-input digest |
+| ZIP-244 | ✅ Complete | Shielded txid digest (v5 four-leaf + v6/Ironwood five-leaf) + transparent per-input digest |
 | ZIP-316 | ✅ Complete | Unified Address with Orchard-only receiver |
 | RFC 6979 | ✅ Complete | Deterministic nonce for ECDSA and (analogous) RedPallas |
 | RFC 9380 | ✅ Complete | Pallas hash-to-curve via SWU + 3-isogeny |
@@ -610,7 +688,7 @@ All measurements on Flipper Zero (STM32WB55 @ 64 MHz):
 ### Reference test vectors
 
 Cross-checked against `librustzcash` via the 49 KAT vectors in
-`lib/libzcash-orchard-c/tests/test_vectors.c`.
+`lib/libzcash-ironwood-c/tests/test_vectors.c`.
 
 ### Mainnet validation
 
@@ -625,13 +703,19 @@ Evidence captured in `screenshots/mainnet_pair.png`,
 
 ### Implemented mitigations
 
-- **Memory zeroization** — all sensitive data (`sk`, `ask`, `nk`,
-  `rivk`, `seed`, mnemonic, transparent SK) is wiped with `memzero()`
-  immediately after use. The BIP-39 seed is zeroed at the end of each
-  derivation; the transparent SK is zeroed when the signing session
-  closes.
-- **No key logging** — private keys are never printed, logged, or
-  persisted to disk in cleartext.
+- **PIN-sealed mnemonic storage + lockout** — the mnemonic at rest is
+  sealed with AES-256-CTR + HMAC-SHA256 AEAD under a PIN-derived key
+  (`wallet_pin_kdf`, PBKDF2 with 50,000 iterations); 10 failed PIN
+  attempts trip the lockout state machine and wipe the wallet
+  (`helpers/flipz_secure.c`, `wallet_lockout_*`). Change-PIN and
+  wipe-wallet flows are provided in the menu.
+- **Memory zeroization** — working buffers holding `sk`, `seed`, and
+  intermediate scalars are wiped with `memzero()` after use. The BIP-39
+  seed is zeroed at the end of each derivation; the transparent SK is
+  zeroed when the signing session closes. (See the acknowledged
+  limitations below for what deliberately *stays* resident: the session
+  mnemonic cache and the on-SD derived-key cache.)
+- **No key logging** — private keys are never printed or logged.
 - **Library-enforced sighash verification** — Orchard signing refuses
   to run unless the on-device ZIP-244 sighash has been recomputed and
   matched against the companion's value. The check is in the library,
@@ -654,6 +738,15 @@ Evidence captured in `screenshots/mainnet_pair.png`,
   mount inside the Orchard bundle (the cmx field of an encrypted
   action is opaque to ZIP-244 hashing). An attacker would have to
   break Sinsemilla.
+- **Library-enforced memo binding (`enc_ciphertext` recomputation)** —
+  for memo-carrying payloads (HWP v5/v6),
+  `feed_action_with_note_and_memo()` re-derives `esk` from `rseed + ρ`
+  (ZIP-212), recomputes the 580-byte `enc_ciphertext` + `epk` on-chip
+  via Pallas ECDH + Orchard KDF + ChaCha20-Poly1305, and constant-time
+  compares against the action's fields
+  (`SIGNER_ERR_MEMO_MISMATCH`, HWP error `0x0F`). The memo shown on
+  the review screen is the one the device itself verified — a hostile
+  companion cannot display one memo and commit another on chain.
 - **Library-enforced per-output user confirmation (no blind signing)**
   — `verify()` refuses to advance to `SIGNER_VERIFIED` unless every
   captured action has been explicitly confirmed via
@@ -663,6 +756,14 @@ Evidence captured in `screenshots/mainnet_pair.png`,
   and Back/Cancel to abort. A firmware port that skipped the UI loop
   would still be unable to extract a signature; the rejection is in
   the C library, not in device-specific code.
+- **Library-enforced miner-fee confirmation** — the fee is computed
+  on-chip from `transparent_in − transparent_out + value_balance` with
+  overflow and negative-fee detection, presented on the trusted screen
+  (the dispatcher's `review_output` fallback with `"Network fee"`), and
+  `verify()` refuses to advance without explicit approval
+  (`SIGNER_ERR_FEE_NOT_CONFIRMED` / `_OVERFLOW` / `_NEGATIVE`). Closes
+  the `value_balance`-inflation attack that would silently siphon the
+  surplus to miners.
 - **SIGN_REQ recipient cross-check** — the UA advertised by the
   companion in `SIGN_REQ.recipient` is decoded on-device via
   `orchard_decode_ua_orchard_receiver` and compared in constant time
@@ -689,15 +790,30 @@ Evidence captured in `screenshots/mainnet_pair.png`,
 
 - **Not audited.** No independent security review has been performed.
   The `Proof of Concept — not production-ready` disclaimer in
-  `README.md` and `lib/libzcash-orchard-c/SECURITY.md` is intentional
+  `README.md` and `lib/libzcash-ironwood-c/SECURITY.md` is intentional
   and remains in place until an audit is funded and complete.
-- **`wallet.dat` confidentiality.** Mnemonic-on-SD encryption uses RC4
-  with a K1/K2 scheme: K1 is a static literal compiled into the
-  firmware; K2 is generated fresh per save and itself encrypted with
-  K1. Because K1 is hardcoded, this is **obfuscation against casual
-  inspection**, not confidentiality against an attacker with a copy
-  of the firmware. A future revision should derive K1 from a user PIN
-  or passphrase.
+- **Derived-key cache on SD is not encrypted.** While the mnemonic at
+  rest is PIN-sealed (AEAD), the derived Orchard keys — **including the
+  spending key `ask`** — are cached in cleartext hex in the `wallet.dat`
+  keys section (plus its `.bak` copy) to skip the multi-minute
+  Sinsemilla re-derivation on each signing session
+  (`wallet_save_keys()` / `wallet_load_keys()`). An attacker with
+  physical access to the SD card can extract the spending key without
+  the PIN. Sealing the key cache with the same PIN-derived AEAD (or
+  dropping the cache) is the natural next hardening step.
+- **Mnemonic cached in RAM while unlocked.** After PIN unlock the
+  plaintext mnemonic stays in `cached_mnemonic` for the whole session
+  (needed for on-demand derivation and mnemonic display); it is not
+  re-zeroed until lock/exit.
+- **Legacy RC4 `wallet.dat` migration path.** Pre-PIN wallets encrypted
+  with the RC4 K1/K2 scheme (hardcoded K1 — obfuscation, not
+  confidentiality) are still readable once for migration; new wallets
+  are only ever written PIN-sealed.
+- **Sinsemilla LUT not verified at boot.** The library provides
+  `pallas_verify_sinsemilla_table()` (audit M-5) but the firmware does
+  not call it yet; a tampered `sinsemilla_s.bin` on the SD card would
+  be trusted. (Each entry is independently recomputable, but no check
+  runs on-device.)
 - **Single account, single address per pool.** The ZIP-32 Orchard
   account is fixed to 0; the transparent BIP-44 path is fixed to
   `m / 44' / coin_type' / 0' / 0 / 0`.
@@ -705,7 +821,10 @@ Evidence captured in `screenshots/mainnet_pair.png`,
   pre-computed 32-byte value in transaction metadata, but no Sapling
   spend authorization, key derivation, or note decryption is
   implemented on-device.
-- **No PIN, no anti-phishing word, no secure element, no attestation.**
+- **No anti-phishing word, no secure element, no device attestation.**
+  The HWP attestation messages (`0x0F`–`0x12`) are defined by the
+  protocol and implemented in the library, but FlipZcash provisions no
+  device-identity key and does not answer them.
 
 ---
 
@@ -727,19 +846,27 @@ signature is emitted; mismatch raises `HWP_ERR_NETWORK_MISMATCH (0x05)`.
 
 ## 15. Menu Structure
 
+With a provisioned wallet (PIN unlock precedes the sensitive entries):
+
 ```
 FlipZcash Wallet
-  ├── View Address       Loads from wallet.dat, displays UA + QR
-  ├── USB Serial Signer  HWP worker (sighash verify + RedPallas + ECDSA)
+  ├── ZEC|TAZ Address    Loads from the address cache, displays UA + QR
+  ├── USB Serial Signer  HWP dispatcher worker (verify + review + sign)
   ├── Keys (Advanced)    ak, nk, rivk in hex
-  ├── Mnemonic           24 words (4 per screen)
-  ├── Regenerate Wallet  New seed (with confirmation)
-  ├── Import Seed        Word-by-word entry with autocomplete
+  ├── Mnemonic           Seed words (4 per screen)
+  ├── Export FVK         Full Viewing Key export for watch-only pairing
+  ├── Regenerate wallet  New seed (with confirmation)
+  ├── Change PIN         Re-seal wallet.sealed under a new PIN
+  ├── Wipe wallet        Erase sealed store + caches (with confirmation)
   └── Settings
        ├── Network         Mainnet (ZEC) / Testnet (TAZ)
        ├── BIP39 Strength  128 / 192 / 256 bit
        └── BIP39 Passphrase On / Off
 ```
+
+Without a wallet, the menu offers `Generate new wallet` and
+`Import mnemonic seed` (word-by-word entry with autocomplete; the PIN is
+collected first so the imported mnemonic is sealed immediately).
 
 ---
 
@@ -752,5 +879,5 @@ FlipZcash Wallet
 | 3 | **Precomputed Sinsemilla `S_i` points.** Eliminate the 51 `hash_to_curve` calls in `SinsemillaShortCommit`. | ✅ Implemented as `sinsemilla_s.bin` SD-card LUT — 15 min → 1.5 min |
 | 4 | **Batch Montgomery-trick inversion** in `iso_map` and SWU. | Not implemented |
 | 5 | **GLV endomorphism on Pallas** to halve scalar-multiplication cost. | Not implemented |
-| 6 | **PIN-derived `wallet.dat` master key** to upgrade obfuscation to confidentiality. | Future revision |
+| 6 | **PIN-derived mnemonic sealing** (AES-256-CTR + HMAC AEAD, PBKDF2 PIN KDF, lockout + wipe). | ✅ Implemented (`helpers/flipz_secure.c` + `wallet.sealed`); the derived-key cache in `wallet.dat` is still cleartext — see §13 |
 | 7 | **Sapling support on-device** | Out of current scope |

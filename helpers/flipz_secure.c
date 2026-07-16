@@ -2,13 +2,13 @@
  * Sealed wallet storage for FlipZcash (audit H-5).
  *
  * Replaces the legacy RC4 wallet.dat with PIN-derived AEAD (AES-256-CTR
- * + HMAC-SHA256) provided by libzcash-orchard-c. See flipz_secure.h.
+ * + HMAC-SHA256) provided by libzcash-ironwood-c. See flipz_secure.h.
  */
 
 #include "flipz_secure.h"
 #include <storage/storage.h>
-#include <aead.h>            /* libzcash-orchard-c: PIN KDF + AEAD seal/unseal */
-#include <wallet_lockout.h>  /* libzcash-orchard-c: pure-data lockout state */
+#include <aead.h>            /* libzcash-ironwood-c: PIN KDF + AEAD seal/unseal */
+#include <wallet_lockout.h>  /* libzcash-ironwood-c: pure-data lockout state */
 #include <rand.h>            /* random_buffer */
 #include <memzero.h>
 #include <string.h>
