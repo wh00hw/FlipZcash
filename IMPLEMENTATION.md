@@ -13,7 +13,7 @@ companion [`README.md`](README.md) gives the user-facing overview.
 ### Cryptographic library — `lib/libzcash-orchard-c/` (git submodule)
 
 A standalone, MIT-licensed, zero-dependency C11 library
-([github.com/wh00hw/libzcash-orchard-c](https://github.com/wh00hw/libzcash-orchard-c))
+([github.com/wh00hw/libzcash-ironwood-c](https://github.com/wh00hw/libzcash-ironwood-c))
 consumed unmodified by FlipZcash and by the ESP32-S2 reference port
 (`zcash-hw-wallet-esp32`). Files linked into the FlipZcash `.fap` via
 `application.fam`:

@@ -88,7 +88,7 @@ The BIP39 mnemonic implementation and the overall Flipper Zero app architecture 
 
 FlipZcash relies on two companion libraries, both purpose-built for this project:
 
-- **[libzcash-orchard-c](https://github.com/wh00hw/libzcash-orchard-c)** (git submodule) — Pure C implementation of Zcash cryptography: Pallas curve arithmetic, Sinsemilla hash, RedPallas signatures, ZIP-32 key derivation, FF1-AES-256, F4Jumble, BIP-39, BIP-32, secp256k1 + ECDSA (RFC 6979), full ZIP-244 sighash computation (shielded and transparent txid digests + per-input sig digest), and the `OrchardSigner` state machine for on-device sighash verification. Portable across embedded targets.
+- **[libzcash-orchard-c](https://github.com/wh00hw/libzcash-ironwood-c)** (git submodule) — Pure C implementation of Zcash cryptography: Pallas curve arithmetic, Sinsemilla hash, RedPallas signatures, ZIP-32 key derivation, FF1-AES-256, F4Jumble, BIP-39, BIP-32, secp256k1 + ECDSA (RFC 6979), full ZIP-244 sighash computation (shielded and transparent txid digests + per-input sig digest), and the `OrchardSigner` state machine for on-device sighash verification. Portable across embedded targets.
 
 - **[zcash-hw-wallet-sdk](https://github.com/wh00hw/zcash-hw-wallet-sdk)** — Rust SDK implementing the Hardware Wallet Protocol (HWP v3), the binary framed serial protocol used for communication between the Flipper Zero and the companion broadcast app. Handles PCZT parsing, Orchard proof generation, staged sighash verification for both shielded and transparent bundles, and signature collection (RedPallas + ECDSA).
 
@@ -225,7 +225,7 @@ FlipZcash/
 
 FlipZcash's distinguishing technical contribution is not the Flipper Zero
 firmware itself but the underlying
-[`libzcash-orchard-c`](https://github.com/wh00hw/libzcash-orchard-c) library:
+[`libzcash-orchard-c`](https://github.com/wh00hw/libzcash-ironwood-c) library:
 the first portable, vendor-neutral, MIT-licensed plain-C implementation of
 the Orchard primitives. The same library powers an ESP32-S2 reference port
 ([`zcash-hw-wallet-esp32`](https://github.com/wh00hw/zcash-hw-wallet-esp32))

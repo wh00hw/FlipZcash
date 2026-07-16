@@ -16,11 +16,29 @@ App(
     # "Not enough memory" on preload.
     order=10,
     fap_icon="flipz_10px.png",
+    # RAM tuning for the Flipper Zero (256 KB SRAM, ~130 KB free heap for
+    # FAPs). libzcash-orchard-c is generic; its capacity tunables are
+    # overridden here instead of edited in the library. The same values
+    # MUST appear in the Lib() cdefines below and stay consistent across
+    # every translation unit — they shape struct layouts (enforced by
+    # _Static_asserts in views/flipz_scene_1.c).
+    cdefines=[
+        "ORCHARD_SIGNER_MAX_ACTIONS=8",
+        "ORCHARD_SIGNER_MAX_MEMOS=4",
+        "HWP_MAX_PAYLOAD=1536",
+    ],
     fap_private_libs=[
         Lib(
-            name="libzcash-orchard-c",
+            name="libzcash-ironwood-c",
             fap_include_paths=["include", "src"],
-            cdefines=["ZORCHARD_NO_EXPLICIT_BZERO", "USE_PLATFORM_RNG=1"],
+            cdefines=[
+                "ZORCHARD_NO_EXPLICIT_BZERO",
+                "USE_PLATFORM_RNG=1",
+                # Keep in sync with the App-level cdefines above.
+                "ORCHARD_SIGNER_MAX_ACTIONS=8",
+                "ORCHARD_SIGNER_MAX_MEMOS=4",
+                "HWP_MAX_PAYLOAD=1536",
+            ],
             sources=[
                 "src/bignum.c",
                 "src/memzero.c",

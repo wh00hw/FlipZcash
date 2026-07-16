@@ -797,7 +797,7 @@ static int32_t sign_worker_thread(void* ctx) {
 
     s_progress_offset = 20;
     s_progress_scale = 5;
-    s_progress_label = "Loading Orchard keys...";
+    s_progress_label = "Loading shielded keys...";
     bool keys_ok = wallet_load_keys(w->testnet, ask, ak, nk, rivk);
     if(!keys_ok) {
         /* Cache miss: derive Orchard ask/nk/rivk via Sinsemilla. The
@@ -805,7 +805,7 @@ static int32_t sign_worker_thread(void* ctx) {
          * the 25..100 % band. */
         s_progress_offset = 25;
         s_progress_scale = 75;
-        s_progress_label = "Deriving Orchard keys...";
+        s_progress_label = "Deriving shielded keys...";
         CONFIDENTIAL uint8_t sk[32];
         orchard_derive_account_sk(seed, w->coin_type, DERIV_ACCOUNT, sk);
         orchard_derive_keys(sk, ask, nk, rivk);
@@ -829,8 +829,32 @@ static int32_t sign_worker_thread(void* ctx) {
     /* ===== Dispatcher invocation ====================================== */
     flipz_serial_init();
 
-    OrchardSignerCtx signer_ctx;
-    orchard_signer_init(&signer_ctx);
+    /* The signer context (~6 KB: per-action review entries, the shared
+     * memo pool and three ZIP-244 digest states) is far too large for
+     * this thread's 8 KB stack. Heap-allocate it for the session;
+     * reset() scrubs all key/session material before the free.
+     *
+     * The asserts pin FlipZcash's RAM tuning: the application.fam
+     * cdefines MUST have reached this translation unit (a silent
+     * fallback to the library's generic defaults would be an ABI
+     * mismatch with the lib objects AND a heap-budget blowout), and the
+     * session objects must stay within the budget that lets the FAP
+     * load and sign inside the Flipper's free heap. */
+    _Static_assert(
+        ORCHARD_SIGNER_MAX_ACTIONS == 8 && ORCHARD_SIGNER_MAX_MEMOS == 4 &&
+            HWP_MAX_PAYLOAD == 1536,
+        "FlipZcash RAM tuning lost: check application.fam cdefines (App AND Lib)");
+    _Static_assert(sizeof(OrchardSignerCtx) <= 6 * 1024,
+                   "signer ctx outgrew the Flipper heap budget");
+    /* The dispatcher lives on this worker's stack (10 KB). Since
+     * libzcash-ironwood-c 4bc03c2 it embeds the HwpSignReq scratch (recipient
+     * cap 255 -> ~340 B) so handle_sign_req stays within the 512 B
+     * per-function budget; together with the 1536 B RX parser that puts the
+     * struct just over 2 KB. 3 KB leaves headroom on the worker stack. */
+    _Static_assert(sizeof(HwpDispatcher) <= 3 * 1024,
+                   "dispatcher outgrew the worker-stack budget");
+    OrchardSignerCtx* signer_ctx = malloc(sizeof(OrchardSignerCtx));
+    orchard_signer_init(signer_ctx);
 
     /* Wire the FlipZ-specific I/O + UI primitives into the generic
      * hwp_dispatcher (libzcash-orchard-c). All target-agnostic protocol
@@ -839,36 +863,40 @@ static int32_t sign_worker_thread(void* ctx) {
      * lives in the library so every device target (FlipZcash, future
      * ESP32 / BOLOS) gets the same battle-tested driver instead of each
      * re-implementing it. */
-    HwpDispatcher d = {
-        .io = {
-            .serial_drain  = flipz_disp_drain,
-            .serial_send   = flipz_disp_send,
-            .get_tick_ms   = flipz_disp_tick,
-            .sleep_ms      = flipz_disp_sleep,
-            .should_exit   = flipz_disp_should_exit,
-        },
-        .ui = {
-            .review_output = flipz_disp_review_output,
-            .review_memo   = flipz_disp_review_memo,
-            .confirm_tx    = flipz_disp_confirm_tx,
-            .network_error = flipz_disp_network_error,
-            .phase_update  = flipz_disp_phase,
-            .progress      = flipz_disp_progress,
-        },
-        .keys = {
-            .ak       = ak,
-            .nk       = nk,
-            .rivk     = rivk,
-            .ask      = ask,
-            .t_sk     = t_sk,
-            .t_pubkey = t_pubkey,
-        },
-        .signer    = &signer_ctx,
-        .testnet   = w->testnet,
-        .user_ctx  = w,
-    };
+    /* The dispatcher embeds the HWP TX frame buffer + RX parser (~4.4 KB,
+     * moved out of the library's static storage to shrink the FAP image),
+     * so it is heap-allocated for the session — the worker stack is 10 KB.
+     * Fields are assigned individually to avoid a stack-resident compound
+     * literal of the full struct size. */
+    HwpDispatcher* d = malloc(sizeof(HwpDispatcher));
+    memset(d, 0, sizeof(*d));
+    d->io.serial_drain  = flipz_disp_drain;
+    d->io.serial_send   = flipz_disp_send;
+    d->io.get_tick_ms   = flipz_disp_tick;
+    d->io.sleep_ms      = flipz_disp_sleep;
+    d->io.should_exit   = flipz_disp_should_exit;
+    d->ui.review_output = flipz_disp_review_output;
+    d->ui.review_memo   = flipz_disp_review_memo;
+    d->ui.confirm_tx    = flipz_disp_confirm_tx;
+    d->ui.network_error = flipz_disp_network_error;
+    d->ui.phase_update  = flipz_disp_phase;
+    d->ui.progress      = flipz_disp_progress;
+    d->keys.ak       = ak;
+    d->keys.nk       = nk;
+    d->keys.rivk     = rivk;
+    d->keys.ask      = ask;
+    d->keys.t_sk     = t_sk;
+    d->keys.t_pubkey = t_pubkey;
+    d->signer   = signer_ctx;
+    d->testnet  = w->testnet;
+    d->user_ctx = w;
 
-    hwp_dispatcher_run(&d);
+    hwp_dispatcher_run(d);
+
+    orchard_signer_reset(signer_ctx); /* scrub session material */
+    free(signer_ctx);
+    memzero(d, sizeof(*d));           /* frame buffer may hold tx bytes */
+    free(d);
 
     flipz_serial_deinit();
 
@@ -962,21 +990,77 @@ void flipz_scene_1_draw(Canvas* canvas, FlipZScene1Model* model) {
 
     if(model->page == PAGE_LOADING) {
         canvas_set_font(canvas, FontPrimary);
-        /* Title reflects what the heavy crypto underneath is actually
-         * doing — "Generate address" during the receive-address flow,
-         * "Signing transaction" during a sign session (any non-zero
-         * s_sign_page means we're inside FlipZSceneScene_1's sign
-         * branch rather than gen-address). */
-        canvas_draw_str(canvas, 2, 10,
-            (s_sign_page != 0) ? "Signing transaction" : "Generate address");
+        /* Title reflects the current stage of the signing flow. During a
+         * sign session (s_sign_page != 0) the dispatcher drives
+         * s_link_phase, and for the VERIFY and SIGNING phases it also
+         * publishes a 1-based step counter in s_link_act_idx /
+         * s_link_act_total. Surface that as "Verifying N/M" / "Signing N/M"
+         * so the user follows a clear per-action progression instead of an
+         * opaque "Signing transaction". Outside a sign session this screen
+         * is the address-generation crypto, titled accordingly. */
+        char title[24];
+        const char* title_str;
+        if(s_sign_page != 0) {
+            switch(s_link_phase) {
+            case HWP_PHASE_VERIFY:
+                if(s_link_act_total > 0) {
+                    snprintf(title, sizeof(title), "Verifying %u/%u",
+                             (unsigned)s_link_act_idx, (unsigned)s_link_act_total);
+                    title_str = title;
+                } else {
+                    title_str = "Verifying...";
+                }
+                break;
+            case HWP_PHASE_SIGNING:
+                if(s_link_act_total > 0) {
+                    snprintf(title, sizeof(title), "Signing %u/%u",
+                             (unsigned)s_link_act_idx, (unsigned)s_link_act_total);
+                    title_str = title;
+                } else {
+                    title_str = "Signing...";
+                }
+                break;
+            default:
+                title_str = "Signing transaction";
+                break;
+            }
+        } else {
+            title_str = "Generate address";
+        }
+        canvas_draw_str(canvas, 2, 10, title_str);
+
         canvas_set_font(canvas, FontSecondary);
         canvas_draw_str(canvas, 2, 24, s_progress_label);
         canvas_draw_frame(canvas, 2, 34, 124, 10);
         uint8_t fill = (uint8_t)((uint32_t)s_progress_pct * 120 / 100);
         if(fill > 0) canvas_draw_box(canvas, 4, 36, fill, 6);
-        char pct_text[8];
-        snprintf(pct_text, sizeof(pct_text), "%d%%", s_progress_pct);
-        canvas_draw_str_aligned(canvas, 64, 52, AlignCenter, AlignTop, pct_text);
+
+        /* During the per-action RedPallas signing phase, replace the bare
+         * percentage with a row of step dots — one per Orchard action:
+         * filled = already signed or currently signing, hollow = pending.
+         * This makes the whole multi-action signature flow legible at a
+         * glance (how many actions, which one we're on). Other phases keep
+         * the plain percentage (the single crypto op's progress). */
+        if(s_sign_page != 0 && s_link_phase == HWP_PHASE_SIGNING &&
+           s_link_act_total > 0 && s_link_act_total <= 16) {
+            uint16_t n = s_link_act_total;
+            uint16_t done = s_link_act_idx; /* 1-based: dots [0..done-1] filled */
+            const int gap = 9;
+            int x0 = 64 - ((int)(n - 1) * gap) / 2;
+            const int y = 50;
+            for(uint16_t i = 0; i < n; i++) {
+                int cx = x0 + (int)i * gap;
+                if(i < done) {
+                    canvas_draw_disc(canvas, cx, y, 2);
+                } else {
+                    canvas_draw_circle(canvas, cx, y, 2);
+                }
+            }
+        } else {
+            char pct_text[8];
+            snprintf(pct_text, sizeof(pct_text), "%d%%", s_progress_pct);
+            canvas_draw_str_aligned(canvas, 64, 52, AlignCenter, AlignTop, pct_text);
+        }
 
     } else if(model->page == PAGE_ADDR_ZEC) {
         const char* addr = model->recv_address;
@@ -1732,8 +1816,12 @@ void flipz_scene_1_enter(void* context) {
         strncpy(sctx->passphrase, passphrase_text, TEXT_BUFFER_SIZE - 1);
         sctx->passphrase[TEXT_BUFFER_SIZE - 1] = '\0';
 
+        /* 8 KB: the two big session objects (signer ctx, dispatcher) are
+         * heap-allocated by the worker, and every libzcash function is
+         * held to a 512-byte frame budget (scripts/check_stack.sh), so
+         * the worker's own stack stays shallow. */
         instance->worker_thread = furi_thread_alloc_ex(
-            "ZcashSign", 10240, sign_worker_thread, sctx);
+            "ZcashSign", 8192, sign_worker_thread, sctx);
         furi_thread_start(instance->worker_thread);
         return;
     }
