@@ -1,3 +1,3 @@
-[submodule "lib/libzcash-orchard-c"]
-	path = lib/libzcash-orchard-c
-	url = https://github.com/wh00hw/libzcash-orchard-c.git
+[submodule "lib/libzcash-ironwood-c"]
+	path = lib/libzcash-ironwood-c
+	url = https://github.com/wh00hw/libzcash-ironwood-c.git
